@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """
 Count the number of cells with concentration above a threshold in result_###.vtu
-files and create an intensity-vs-time profile.
+files and create a fraction-above-threshold-vs-time profile.
 
 Edit the SETTINGS block below. No command-line parsing is used.
 """
 
+import csv
 import os
 import re
 import sys
@@ -21,14 +22,16 @@ ARRAY_NAME = "Concentration"   # Name of the concentration array
 THRESHOLD = 5.0                # Count cells with concentration > THRESHOLD
 DT = 0.01                      # Seconds per result index, e.g. result_346 -> 3.46 s
 
-T_START = 0                  # Start time in seconds
-T_END = 6.1                   # End time in seconds; use None for last available file
+T_START = 4.45                  # Start time in seconds
+T_END = None                  # End time in seconds; use None for last available file
 
-NORMALIZE_Y = False            # If True, plot y-axis as 0 to 1
+NORMALIZE_Y = True            # If True, plot y-axis as 0 to 1
 STRICT_TIME_WINDOW = False     # If True, only include files with exact implied time in [T_START, T_END]
 
-# Leave as None to auto-name outputs in RESULTS_DIR
+# Leave as None to auto-name outputs in the configured output directories
 OUT_PREFIX = None
+
+LOCAL_OUTPUT_DIR = "/Users/tejjolly/Documents/BioSimm/Simulations/Post_Processing/2025-11-05--multi-tests/images"
 
 # Path to pvpython for auto-relaunch if vtk is unavailable in regular python
 PVPYTHON_PATH = "/Applications/ParaView-5.13.1.app/Contents/bin/pvpython"
@@ -114,11 +117,116 @@ def read_array_as_cell_array(vtu_path: Path, array_name: str):
     )
 
 
-def build_output_prefix(results_dir: Path, array_name: str, threshold: float, out_prefix):
+def build_geometry_name(results_dir: Path):
+    geometry_name = results_dir.parent.name.strip()
+    if not geometry_name:
+        raise RuntimeError(f"Could not determine geometry name from results dir:\n{results_dir}")
+    return geometry_name
+
+
+def build_output_stem(results_dir: Path, out_prefix):
     if out_prefix:
-        return Path(out_prefix)
-    safe_thr = str(threshold).replace(".", "p")
-    return results_dir / f"cell_intensity_{array_name}_thr_{safe_thr}"
+        return Path(out_prefix).name
+    geometry_name = build_geometry_name(results_dir)
+    return f"{geometry_name}-intensity"
+
+
+def build_output_prefixes(results_dir: Path, out_prefix):
+    stem = build_output_stem(results_dir, out_prefix)
+    prefixes = [
+        Path(LOCAL_OUTPUT_DIR) / stem,
+        results_dir.parent / stem,
+    ]
+
+    unique_prefixes = []
+    seen = set()
+    for prefix in prefixes:
+        resolved = str(prefix)
+        if resolved not in seen:
+            seen.add(resolved)
+            unique_prefixes.append(prefix)
+    return unique_prefixes
+
+
+def load_cached_results(output_prefixes, threshold: float, array_name: str):
+    for out_prefix in output_prefixes:
+        csv_path = out_prefix.with_suffix(".csv")
+        if not csv_path.exists():
+            continue
+
+        cached = {}
+        with open(csv_path, newline="") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                try:
+                    row_idx = int(row["file_index"])
+                    row_threshold = float(row["threshold"])
+                    row_array_name = row["array_name"]
+                except (KeyError, TypeError, ValueError):
+                    continue
+
+                if not math.isclose(row_threshold, threshold, rel_tol=0.0, abs_tol=1e-12):
+                    continue
+                if row_array_name != array_name:
+                    continue
+
+                try:
+                    fraction = float(row["fraction_above_threshold"])
+                    count = int(row["cells_above_threshold"])
+                    n_cells = int(row["total_cells"])
+                except (KeyError, TypeError, ValueError):
+                    continue
+
+                cached[row_idx] = {
+                    "fraction": fraction,
+                    "count": count,
+                    "total_cells": n_cells,
+                    "data_origin": row.get("data_origin", "cached"),
+                }
+
+        if cached:
+            return cached, csv_path
+
+    return {}, None
+
+
+def write_csv(csv_path: Path, times, selected, fractions, fractions_norm, counts, total_cells, data_origin):
+    with open(csv_path, "w") as f:
+        f.write(
+            "time_s,file_index,fraction_above_threshold,normalized_fraction_above_threshold,"
+            "cells_above_threshold,total_cells,threshold,array_name,data_origin\n"
+        )
+        for t, (idx, _), frac, frac_norm, count, n_cells in zip(
+            times, selected, fractions, fractions_norm, counts, total_cells
+        ):
+            f.write(
+                f"{t:.8f},{idx},{frac:.8f},{frac_norm:.8f},{int(count)},{int(n_cells)},"
+                f"{THRESHOLD},{ARRAY_NAME},{data_origin}\n"
+            )
+
+
+def save_plot(png_path: Path, times, y):
+    fig, ax = plt.subplots(figsize=(8, 4.5))
+    ax.plot(times, y, color="black", linewidth=1.5)
+    ax.set_xlabel("Time [s]")
+
+    if NORMALIZE_Y:
+        ax.set_ylabel("Normalized Pixel Count")
+        ax.set_ylim(0.0, 1.0)
+    else:
+        ax.set_ylabel("Pixel Count Fraction")
+
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    fig.tight_layout()
+    fig.savefig(png_path, dpi=300)
+    plt.close(fig)
+
+
+def build_png_paths(out_prefix: Path):
+    frac_png_path = out_prefix.parent / f"{out_prefix.name}-frac.png"
+    norm_png_path = out_prefix.parent / f"{out_prefix.name}-norm.png"
+    return frac_png_path, norm_png_path
 
 
 def main():
@@ -167,62 +275,92 @@ def main():
     print(f"[INFO] Files selected: {len(selected)}")
     print(f"[INFO] First/last    : result_{selected[0][0]}.vtu to result_{selected[-1][0]}.vtu")
 
+    out_prefixes = build_output_prefixes(results_dir, OUT_PREFIX)
+    cached_results, cache_source = load_cached_results(out_prefixes, THRESHOLD, ARRAY_NAME)
+    if cache_source is not None:
+        print(f"[INFO] Cache source  : {cache_source}")
+        print(f"[INFO] Cached rows   : {len(cached_results)}")
+
     times = []
     counts = []
+    fractions = []
+    total_cells = []
     data_origin_used = None
 
     for idx, path in selected:
-        values, origin = read_array_as_cell_array(path, ARRAY_NAME)
-        if data_origin_used is None:
-            data_origin_used = origin
+        cached = cached_results.get(idx)
+        if cached is not None:
+            fraction_above = float(cached["fraction"])
+            count_above = int(cached["count"])
+            n_cells = int(cached["total_cells"])
+            origin = cached["data_origin"]
+            if data_origin_used is None:
+                data_origin_used = origin
+            print(
+                f"[CACHE] {path.name}: time={idx * DT:.4f} s, fraction_above_{THRESHOLD}={fraction_above:.8f}, "
+                f"cells_above_{THRESHOLD}={count_above}/{n_cells}"
+            )
+        else:
+            values, origin = read_array_as_cell_array(path, ARRAY_NAME)
+            if data_origin_used is None:
+                data_origin_used = origin
 
-        count_above = int(np.count_nonzero(values > THRESHOLD))
+            count_above = int(np.count_nonzero(values > THRESHOLD))
+            n_cells = int(values.size)
+            fraction_above = (count_above / n_cells) if n_cells > 0 else 0.0
+
+            print(
+                f"[OK] {path.name}: time={idx * DT:.4f} s, fraction_above_{THRESHOLD}={fraction_above:.8f}, "
+                f"cells_above_{THRESHOLD}={count_above}/{n_cells}"
+            )
+
         t = idx * DT
 
         times.append(t)
         counts.append(count_above)
-
-        print(f"[OK] {path.name}: time={t:.4f} s, cells_above_{THRESHOLD}={count_above}")
+        fractions.append(fraction_above)
+        total_cells.append(n_cells)
 
     times = np.asarray(times, dtype=float)
     counts = np.asarray(counts, dtype=float)
+    fractions = np.asarray(fractions, dtype=float)
+    total_cells = np.asarray(total_cells, dtype=int)
 
-    max_count = float(np.max(counts)) if len(counts) > 0 else 0.0
-    counts_norm = counts / max_count if max_count > 0 else np.zeros_like(counts)
+    max_fraction = float(np.max(fractions)) if len(fractions) > 0 else 0.0
+    fractions_norm = fractions / max_fraction if max_fraction > 0 else np.zeros_like(fractions)
 
-    y = counts_norm if NORMALIZE_Y else counts
+    saved_csv_paths = []
+    saved_png_paths = []
 
-    out_prefix = build_output_prefix(results_dir, ARRAY_NAME, THRESHOLD, OUT_PREFIX)
-    out_prefix.parent.mkdir(parents=True, exist_ok=True)
-
-    csv_path = out_prefix.with_suffix(".csv")
-    png_path = out_prefix.with_suffix(".png")
-
-    with open(csv_path, "w") as f:
-        f.write("time_s,file_index,cells_above_threshold,normalized_cells_above_threshold,threshold,array_name,data_origin\n")
-        for t, (idx, _), c, cn in zip(times, selected, counts, counts_norm):
-            f.write(f"{t:.8f},{idx},{int(c)},{cn:.8f},{THRESHOLD},{ARRAY_NAME},{data_origin_used}\n")
-
-    plt.figure(figsize=(8, 4.5))
-    plt.plot(times, y, marker="o")
-    plt.xlabel("Time [s]")
-    if NORMALIZE_Y:
-        plt.ylabel("Normalized intensity")
-        plt.ylim(0.0, 1.0)
-        title_y = "normalized cell count"
-    else:
-        plt.ylabel("Cells above threshold")
-        title_y = "cell count"
-
-    plt.title(f"Intensity profile ({title_y})\n{ARRAY_NAME} > {THRESHOLD}")
-    plt.grid(True, alpha=0.3)
-    plt.tight_layout()
-    plt.savefig(png_path, dpi=300)
-    plt.close()
+    for out_prefix in out_prefixes:
+        csv_path = out_prefix.with_suffix(".csv")
+        frac_png_path, norm_png_path = build_png_paths(out_prefix)
+        try:
+            out_prefix.parent.mkdir(parents=True, exist_ok=True)
+            write_csv(
+                csv_path,
+                times,
+                selected,
+                fractions,
+                fractions_norm,
+                counts,
+                total_cells,
+                data_origin_used,
+            )
+            save_plot(frac_png_path, times, fractions)
+            saved_csv_paths.append(csv_path)
+            saved_png_paths.append(frac_png_path)
+            if NORMALIZE_Y:
+                save_plot(norm_png_path, times, fractions_norm)
+                saved_png_paths.append(norm_png_path)
+        except Exception as exc:
+            print(f"[WARN] Could not save outputs to {out_prefix.parent}: {exc}")
 
     print("\n[DONE]")
-    print(f"CSV written to: {csv_path}")
-    print(f"PNG written to: {png_path}")
+    for csv_path in saved_csv_paths:
+        print(f"CSV written to: {csv_path}")
+    for png_path in saved_png_paths:
+        print(f"PNG written to: {png_path}")
     print(f"Data origin used: {data_origin_used}")
 
 

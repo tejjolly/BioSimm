@@ -9,27 +9,31 @@ from matplotlib.lines import Line2D
 # ============================================================
 # TOGGLES — change here in the IDE
 # ============================================================
-RUN_PHASES = [2, 3]          # e.g. [1,2,3] or [2,3] or [3]
-RUN_GEOMETRIES = ["13", "37", "60"]      # order matters
+RUN_PHASES = [1, 2]          # e.g. [1,2,3] or [2,3] or [3]
+RUN_GEOMETRIES = ["80"]      # order matters
 PLOT_VELOCITY = False         # show velocity + secondary y in phase 2
-THRESHOLD = 0.0              # slope: from max conc down to <= this
-FIT_GEOMETRY = True          # fit HMR vs TAG per geometry in phase 3
+THRESHOLD = 0            # slope: from max conc down to <= this
+FIT_GEOMETRY = False          # fit HMR vs TAG per geometry in phase 3
 NORMALIZE_CONC = False        # normalize phase-2 curves by their own max
 NORMALIZED_TAG = False
+PHASE1_MANUAL_TIME = 5.6    # set a physical time to override the auto t_max lookup in phase 1
+REVERSE_CENTERLINE_DIRECTION = True  # if True, treat the end of the current arc/profile as the physical inlet
 
 PHASE2_FONTSIZE = 16         # controls only Phase-2 figure text
 
 # Global-ish figure size controls
-FIGSIZE_PHASE2 = (3, 2)      # for phase-2 concentration plots (original 8x5)
-FIGSIZE_PHASE3 = (3, 2)      # for TAG vs HMR plots (combined + individual) (original 6x4)
+FIGSIZE_PHASE2 = (8, 5)      # for phase-2 concentration plots (original 8x5)
+FIGSIZE_PHASE3 = (8, 5)      # for TAG vs HMR plots (combined + individual) (original 6x4)
 
-PHASE2_CLEAN = True   # removes all axis text/labels/ticks/legend/title
+PHASE2_CLEAN = False   # removes all axis text/labels/ticks/legend/title
 PHASE2_LEGEND = True
-PLOT_TITLES = False
+PLOT_TITLES = True
+PHASE2_BUPU_RANGE = (1, 1.0)  # min/max fraction of the BuPu colormap used in phase 2
 
 # dyes / AIFs
-DYES = ["N", "B"]            # B -> slow AIF, N -> fast AIF
+DYES = [""]                  # empty string means no dye label in the case name
 DYE_LABELS = {
+    "": "no dye label",
     "B": "flat dye input @ time t",
     "N": "sharp dye input @ time t",
 }
@@ -39,6 +43,7 @@ GEOM_LABELS = {
     "13": "Stenosis",
     "37": "No stenosis",
     "60": "Patient specific",
+    "80": "Mass balance",
 }
 
 PHASE2_FONTSIZE = 16         # controls only Phase-2 figure text
@@ -48,41 +53,159 @@ PHASE2_FONTSIZE = 16         # controls only Phase-2 figure text
 # ------------------------------------------------------------
 # PATHS / CONFIG
 # ------------------------------------------------------------
-BASE = "/Volumes/biosimm-Tej-Jolly/2025-11-16--TAG"
+BASE = "/Volumes/biosimm-Tej-Jolly/2026-02-03--mass_balance"
 
 PV_PYTHON = "/Applications/ParaView-5.13.1.app/Contents/bin/pvpython"
 EXTRACT_SCRIPT = (
     "/Users/tejjolly/Documents/BioSimm/Simulations/Post_Processing/"
-    "2025-11-05--multi-tests/extract_concentration.py"
+    "2025-11-05--multi-tests/extract_concentration_v2.py"
 )
 
 HMR_CSV = os.path.join(BASE, "hmr_data.csv")
 
 # run suffixes per geometry (your latest)
 RUN_SUFFIXES = {
-    "13": ["24", "43", "62", "100"],
-    "37": ["24", "43", "62", "100"],
-    "60": ["24", "43", "62", "100"]
+    "80": [""],
 }
 
 # arc-length file per geometry
 ARC_PATHS = {
-    "13": os.path.join(BASE, "g13_arclen.csv"),
-    "37": os.path.join(BASE, "g37_arclen.csv"),
-    "60": os.path.join(BASE, "g60_arclen.csv"),
-    # "60": os.path.join(BASE, "path_patient_arclen.csv"),  # example
+    "80": [
+        os.path.join(BASE, "centerline_LCA.csv"),
+        (
+            "/Users/tejjolly/Documents/BioSimm/Simulations/Post_Processing/"
+            "2025-11-05--multi-tests/centerlines/centerline_LCA.csv"
+        ),
+    ],
 }
 
 # concentration directory: e.g. BASE/concentrations/g13_r43_dB_concentration.csv
 CONC_DIR = "/Users/tejjolly/Documents/BioSimm/Simulations/Post_Processing/2025-11-05--multi-tests/concentrations"
 
-clevel = [0.2, 1]
 # ------------------------------------------------------------
 
 
+def make_cmap_levels(level_range, count: int):
+    start, stop = level_range
+    if count <= 0:
+        return np.array([])
+    if count == 1:
+        return np.array([(start + stop) / 2.0])
+    return np.linspace(start, stop, count)
+
+
 def suffix_to_rmicro(sfx: str) -> float:
+    if not sfx:
+        return np.nan
     base = sfx.split("_")[0]   # '81_v2' -> '81'
     return float(base) / 100.0
+
+
+def build_case_base(geom: str, suffix: str = "") -> str:
+    case = f"g{geom}"
+    if suffix:
+        case += f"_r{suffix}"
+    return case
+
+
+def build_case_name(geom: str, suffix: str = "", dye: str = "") -> str:
+    case = build_case_base(geom, suffix)
+    if dye:
+        case += f"_d{dye}"
+    return case
+
+
+def build_plot_stem(prefix: str, geom: str, dye: str = "") -> str:
+    stem = f"{prefix}_{geom}"
+    if dye:
+        stem += f"_d{dye}"
+    return stem
+
+
+def resolve_existing_path(path_config):
+    if isinstance(path_config, (list, tuple)):
+        for path in path_config:
+            if os.path.exists(path):
+                return path
+        raise FileNotFoundError(f"Could not find any configured path in {path_config}")
+    return path_config
+
+
+def load_arc_values(path_config):
+    csv_path = resolve_existing_path(path_config)
+    arc_df = pd.read_csv(csv_path)
+
+    if "ArcLength" in arc_df.columns:
+        arc_values = arc_df["ArcLength"].to_numpy(dtype=float)
+        arc_values = arc_values[np.isfinite(arc_values)]
+        if arc_values.size > 0:
+            return orient_arc_values(arc_values)
+
+    point_column_sets = [
+        ("Points_0", "Points_1", "Points_2"),
+        ("Points:0", "Points:1", "Points:2"),
+    ]
+    point_cols = next(
+        (cols for cols in point_column_sets if all(col in arc_df.columns for col in cols)),
+        None,
+    )
+    if point_cols is None:
+        raise ValueError(
+            f"Could not find ArcLength or point columns in {csv_path}: {list(arc_df.columns)}"
+        )
+
+    points = arc_df.loc[:, point_cols].to_numpy(dtype=float)
+    points = points[np.all(np.isfinite(points), axis=1)]
+    if len(points) == 0:
+        raise ValueError(f"No finite centerline points found in {csv_path}")
+
+    arc = np.zeros(len(points))
+    for i in range(1, len(points)):
+        arc[i] = arc[i - 1] + np.linalg.norm(points[i] - points[i - 1])
+    return orient_arc_values(arc)
+
+
+def orient_arc_values(arc_values):
+    arc = np.asarray(arc_values, dtype=float)
+    arc = arc[np.isfinite(arc)]
+    if arc.size == 0:
+        return arc
+
+    if arc[-1] >= arc[0]:
+        arc = arc - arc[0]
+    else:
+        arc = arc[0] - arc
+    if REVERSE_CENTERLINE_DIRECTION:
+        return arc[-1] - arc[::-1]
+    return arc
+
+
+def load_centerline_profile(df: pd.DataFrame, n_arc: int) -> pd.DataFrame:
+    prof = df.iloc[:n_arc].reset_index(drop=True)
+    if REVERSE_CENTERLINE_DIRECTION:
+        prof = prof.iloc[::-1].reset_index(drop=True)
+    return prof
+
+
+def format_suffix_label(geom: str, suffix: str) -> str:
+    if not suffix:
+        return build_case_base(geom, suffix)
+    r_value = suffix_to_rmicro(suffix)
+    if np.isfinite(r_value):
+        return f"R_micro = {r_value:.2f}"
+    return build_case_base(geom, suffix)
+
+
+def sort_suffixes(suffixes):
+    def sort_key(sfx):
+        if not sfx:
+            return (0, -1.0, "")
+        r_value = suffix_to_rmicro(sfx)
+        if np.isfinite(r_value):
+            return (1, r_value, sfx)
+        return (2, float("inf"), sfx)
+
+    return sorted(suffixes, key=sort_key)
 
 
 def make_geom_cmap(geom_index: int):
@@ -95,7 +218,11 @@ def make_geom_cmap(geom_index: int):
 
 def phase1_extract():
     print("[PHASE 1] running pvpython extractor …")
-    subprocess.run([PV_PYTHON, EXTRACT_SCRIPT], check=True)
+    cmd = [PV_PYTHON, EXTRACT_SCRIPT]
+    if PHASE1_MANUAL_TIME is not None:
+        cmd.extend(["--manual-time", str(PHASE1_MANUAL_TIME)])
+        print(f"[PHASE 1] overriding auto t_max with manual time {PHASE1_MANUAL_TIME}")
+    subprocess.run(cmd, check=True)
     print("[PHASE 1] done.")
 
 
@@ -103,9 +230,11 @@ def _conc_csv_path(geom: str, suffix: str, dye: str) -> str:
     """
     Build path like:
     BASE/concentrations/g13_r43_dB_concentration.csv
+    or, for no suffix / no dye cases:
+    BASE/concentrations/g80_concentration.csv
     """
-    case_base = f"g{geom}_r{suffix}_d{dye}"
-    fname = f"{case_base}_concentration.csv"
+    case_name = build_case_name(geom, suffix, dye)
+    fname = f"{case_name}_concentration.csv"
     return os.path.join(CONC_DIR, fname)
 
 
@@ -126,8 +255,7 @@ def compute_tag_threshold_for_geom(geom: str, dye: str, threshold: float = 0.1):
       - y_fit_norm       : fitted normalized values
       - group_max        : max concentration over all suffixes in this (geom, dye) group
     """
-    arc_df = pd.read_csv(ARC_PATHS[geom])
-    arc_all = arc_df["ArcLength"].to_numpy()
+    arc_all = load_arc_values(ARC_PATHS[geom])
     n_arc = len(arc_all)
 
     temp_entries = []
@@ -135,8 +263,8 @@ def compute_tag_threshold_for_geom(geom: str, dye: str, threshold: float = 0.1):
 
     # -------- FIRST PASS: collect segments and find group_max --------
     for suffix in RUN_SUFFIXES[geom]:
-        case_base = f"g{geom}_r{suffix}"
-        case_dye = f"{case_base}_d{dye}"
+        case_base = build_case_base(geom, suffix)
+        case_dye = build_case_name(geom, suffix, dye)
         csv_path = _conc_csv_path(geom, suffix, dye)
 
         if not os.path.exists(csv_path):
@@ -148,8 +276,8 @@ def compute_tag_threshold_for_geom(geom: str, dye: str, threshold: float = 0.1):
             print(f"  [WARN] no 'Concentration' column in {csv_path}, skipping")
             continue
 
-        # Use first n_arc points along the centerline
-        prof = df.iloc[:n_arc].reset_index(drop=True)
+        # Use first n_arc points along the centerline, re-oriented if needed
+        prof = load_centerline_profile(df, n_arc)
 
         conc_all = prof["Concentration"].to_numpy()
         if conc_all.size == 0 or np.all(conc_all == 0):
@@ -279,20 +407,18 @@ def phase2_plot_concentration():
         print(f"[PHASE 2] geometry g{geom}")
 
         # arc-length for this geometry
-        arc_df = pd.read_csv(ARC_PATHS[geom])
-        arc_all = arc_df["ArcLength"].to_numpy()
+        arc_all = load_arc_values(ARC_PATHS[geom])
         n_arc = len(arc_all)
 
         suffixes = RUN_SUFFIXES[geom]
-        r_values = [suffix_to_rmicro(sfx) for sfx in suffixes]
-        ordered = sorted(zip(suffixes, r_values), key=lambda x: x[1])
+        ordered = sort_suffixes(suffixes)
 
         # Use BuPu for ALL concentration plots
         cmap = plt.get_cmap("BuPu")
-        c_levels = np.linspace(clevel[0], clevel[1], len(ordered))
+        c_levels = make_cmap_levels(PHASE2_BUPU_RANGE, len(ordered))
         suffix_to_color = {
             sfx: cmap(level)
-            for (sfx, _), level in zip(ordered, c_levels)
+            for sfx, level in zip(ordered, c_levels)
         }
 
         for dye in DYES:
@@ -309,8 +435,8 @@ def phase2_plot_concentration():
             group_max = 0.0
 
             for suffix in suffixes:
-                case_base = f"g{geom}_r{suffix}"
-                case_dye = f"{case_base}_d{dye}"
+                case_base = build_case_base(geom, suffix)
+                case_dye = build_case_name(geom, suffix, dye)
                 csv_path = _conc_csv_path(geom, suffix, dye)
 
                 if not os.path.exists(csv_path):
@@ -322,8 +448,8 @@ def phase2_plot_concentration():
                     print(f"  [WARN] no 'Concentration' column in {csv_path}, skipping")
                     continue
 
-                # treat entire file as single snapshot along centerline
-                prof = prof_all.iloc[:n_arc].reset_index(drop=True)
+                # treat entire file as single snapshot along centerline, re-oriented if needed
+                prof = load_centerline_profile(prof_all, n_arc)
                 conc = prof["Concentration"].to_numpy()
                 if conc.size == 0:
                     print(f"  [WARN] empty concentration profile for {case_dye}, skipping")
@@ -381,7 +507,7 @@ def phase2_plot_concentration():
                     ax1.plot(
                         x_arc, conc_plot,
                         label=case_base,
-                        alpha=0.7,
+                        alpha=1.0,
                         color=color,
                         linewidth=3
                     )
@@ -419,17 +545,18 @@ def phase2_plot_concentration():
                 # legend keyed by R_micro
                 handles = [
                     Line2D([0], [0], color=suffix_to_color[sfx], lw=3,
-                           label=f"R_micro = {r:.2f}")
-                    for (sfx, r) in ordered
+                           label=format_suffix_label(geom, sfx))
+                    for sfx in ordered
                 ]
                 if PHASE2_LEGEND:
                     ax1.legend(handles=handles, loc="best")
 
                 # Title: geom label + dye
                 geom_name = GEOM_LABELS.get(geom, f"g{geom}")
-                dye_name = DYE_LABELS.get(dye, dye)
+                dye_name = DYE_LABELS.get(dye, dye or "no dye label")
                 if PLOT_TITLES:
-                    ax1.set_title(f"{geom_name}, {dye_name}")
+                    title = geom_name if not dye else f"{geom_name}, {dye_name}"
+                    ax1.set_title(title)
                 # ------------------------------------------------------------
                 # PHASE 2 CLEAN MODE (for inset usage)
                 # ------------------------------------------------------------
@@ -471,7 +598,7 @@ def phase2_plot_concentration():
                             if spine in ax2.spines:
                                 ax2.spines[spine].set_visible(False)
                 fig.tight_layout()
-                out_name = f"tag_{geom}_d{dye}.svg"
+                out_name = f"{build_plot_stem('tag', geom, dye)}.svg"
                 if NORMALIZE_CONC:
                     plt.savefig(
                         f"/Users/tejjolly/Documents/BioSimm/Meetings/2025-11-20--research_update/figures/normalized/{out_name}",
@@ -595,8 +722,8 @@ def phase3_calc_tafe_and_plot_hmr():
     legend_handles = []
     for (geom, dye), color in series_colors.items():
         geom_name = GEOM_LABELS.get(geom, f"g{geom}")
-        dye_name = DYE_LABELS.get(dye, dye)
-        label = f"{geom_name}, {dye_name}"
+        dye_name = DYE_LABELS.get(dye, dye or "no dye label")
+        label = geom_name if not dye else f"{geom_name}, {dye_name}"
         legend_handles.append(
             Line2D(
                 [0], [0],
@@ -639,15 +766,14 @@ def phase3_calc_tafe_and_plot_hmr():
 
         # Extract R_micro (suffix) and sort
         suffixes = sub["suffix"].astype(str).tolist()
-        r_values = [suffix_to_rmicro(sfx) for sfx in suffixes]
-        ordered = sorted(zip(suffixes, r_values), key=lambda x: x[1])
+        ordered = sort_suffixes(suffixes)
 
         # Colormap: span entire BuPu range
         cmap = plt.get_cmap("BuPu")
         c_levels = np.linspace(0.2, 0.95, len(ordered))  # avoid too light/dark
         suffix_to_color = {
             sfx: cmap(level)
-            for (sfx, _), level in zip(ordered, c_levels)
+            for sfx, level in zip(ordered, c_levels)
         }
 
         # scatter point-by-point, each with its own color
@@ -687,12 +813,13 @@ def phase3_calc_tafe_and_plot_hmr():
         ax_s.grid(False)
 
         geom_name = GEOM_LABELS.get(geom, f"g{geom}")
-        dye_name = DYE_LABELS.get(dye, dye)
+        dye_name = DYE_LABELS.get(dye, dye or "no dye label")
         if PLOT_TITLES:
-            ax_s.set_title(f"{geom_name}, {dye_name}")
+            title = geom_name if not dye else f"{geom_name}, {dye_name}"
+            ax_s.set_title(title)
         ax_s.set_ylim([-0.40,0])
         plt.tight_layout()
-        fname = os.path.join(out_dir, f"TAGvHMR_g{geom}_d{dye}.svg")
+        fname = os.path.join(out_dir, f"TAGvHMR_{build_case_name(geom, '', dye)}.svg")
         plt.savefig(fname, format="svg", transparent=True, dpi=600)
         plt.show()
 
