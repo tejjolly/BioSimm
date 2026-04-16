@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
+import csv
 import json
 import os
-import re
 import shutil
 import subprocess
 import pandas as pd
@@ -9,12 +9,27 @@ import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
 
+from helper_scripts.case_utils import (
+    add_output_paths_to_case_specs,
+    build_case_base,
+    build_case_name,
+    concentration_csv_path,
+    expand_case_specs,
+    resolve_existing_path,
+    suffix_to_rmicro,
+)
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+
 # ============================================================
 # TOGGLES — change here in the IDE
 # ============================================================
+# BASE = "/Volumes/maxone/2026-02-03--mass_balance"
 BASE = "/Volumes/biosimm-Tej-Jolly/2026-02-03--mass_balance"
 RUN_PHASES = [1, 2]          # e.g. [1,2,3] or [2,3] or [3]
-RUN_GEOMETRIES = ["87"]      # order matters
+CASES = [
+    "g87_r24",
+]
 PLOT_VELOCITY = False         # show velocity + secondary y in phase 2
 THRESHOLD = 0            # slope: from max conc down to <= this
 FIT_GEOMETRY = False          # fit HMR vs TAG per geometry in phase 3
@@ -22,15 +37,8 @@ NORMALIZE_CONC = True        # normalize phase-2 curves by their own max
 NORMALIZED_TAG = False
 PHASE1_MANUAL_TIME = None    # set a physical time to override the auto t_max lookup in phase 1
 REVERSE_CENTERLINE_DIRECTION = True  # if True, treat the end of the current arc/profile as the physical inlet
-PHASE2_ANIMATION_TIME_RANGE = (5.16, 26.66)  # set to (t_start, t_end) to save one frame per available time in that range
-PHASE2_ANIMATION_OUTPUT_DIR = (
-    "/Users/tejjolly/Documents/BioSimm/Simulations/Post_Processing/"
-    "2025-11-05--multi-tests/images/animation"
-)
-PHASE2_MANUAL_SNAPSHOT_DIR = (
-    "/Users/tejjolly/Documents/BioSimm/Simulations/Post_Processing/"
-    "2025-11-05--multi-tests/images"
-)
+# PHASE2_ANIMATION_TIME_RANGE = (1.72, 24.08)  # set to (t_start, t_end) to save one frame per available time in that range
+PHASE2_ANIMATION_TIME_RANGE = (4.3, 26.6)  # set to (t_start, t_end) to save one frame per available time in that range
 PHASE2_ANIMATION_DPI = 300
 PHASE2_OUTPUT_FORMATS = ("png", "svg")
 OVERWRITE_EXISTING = False  # if False, skip CSVs/frames that already exist; if True, regenerate them
@@ -46,7 +54,11 @@ PHASE2_LEGEND = False
 PLOT_TITLES = False
 PHASE2_BUPU_RANGE = (0.9, 1.0)  # min/max fraction of the BuPu colormap used in phase 2
 
-# dyes / AIFs
+# Legacy Phase-3 grouping knobs. Phase 1/2 use CASES above.
+RUN_GEOMETRIES = ["87"]      # order matters for phase 3
+RUN_SUFFIXES = {
+    "87": ["24"],
+}
 DYES = [""]                  # empty string means no dye label in the case name
 DYE_LABELS = {
     "": "no dye label",
@@ -62,18 +74,13 @@ GEOM_LABELS = {
     "80": "Mass balance",
 }
 
-PHASE2_FONTSIZE = 16         # controls only Phase-2 figure text
-
 # ============================================================
 
 # ------------------------------------------------------------
 # PATHS / CONFIG
 # ------------------------------------------------------------
 PV_PYTHON = "/Applications/ParaView-5.13.1.app/Contents/bin/pvpython"
-EXTRACT_SCRIPT = (
-    "/Users/tejjolly/Documents/BioSimm/Simulations/Post_Processing/"
-    "2025-11-05--multi-tests/extract_concentration_v2.py"
-)
+EXTRACT_SCRIPT = os.path.join(SCRIPT_DIR, "helper_scripts", "extract_centerline_concentration.py")
 
 HMR_CSV = os.path.join(BASE, "hmr_data.csv")
 
@@ -82,105 +89,140 @@ DEFAULT_CHILD_FOLDER = "96-procs"
 CASE_DIR_OVERRIDES = {}
 CHILD_FOLDER_OVERRIDES = {}
 
-# run suffixes per geometry (supports values like "24", "24_v3", "62_fast")
-RUN_SUFFIXES = {
-    "87": ["24"],
-}
+TAG_OUTPUT_FOLDER = "TAG"
+CONCENTRATION_SUBDIR = "concentrations"
+PHASE2_ANIMATION_SUBDIR = "animation"
+PHASE2_STATIC_SUBDIR = "plots"
+PHASE2_MANUAL_SNAPSHOT_SUBDIR = "snapshots"
+PHASE3_SUBDIR = "tag_vs_hmr"
+PHASE2_ANIMATION_METADATA_CSV = "_frame_metadata.csv"
+PHASE2_FRAME_PROGRESS_EVERY = 25
 
-# arc-length file per geometry
-ARC_PATHS = {
-    "87": [
-        os.path.join(BASE, "centerline_LCA.csv"),
-        (
-            "/Users/tejjolly/Documents/BioSimm/Simulations/Post_Processing/"
-            "2025-11-05--multi-tests/centerlines/centerline_LCA.csv"
-        ),
-    ],
-}
-
-# concentration directory: e.g. BASE/concentrations/g13_r43_dB_concentration.csv
-CONC_DIR = "/Users/tejjolly/Documents/BioSimm/Simulations/Post_Processing/2025-11-05--multi-tests/concentrations"
+ARC_PATH = os.path.join(BASE, "centerline_LCA.csv")
 
 # ------------------------------------------------------------
 
 
-def make_cmap_levels(level_range, count: int):
-    start, stop = level_range
-    if count <= 0:
-        return np.array([])
-    if count == 1:
-        return np.array([(start + stop) / 2.0])
-    return np.linspace(start, stop, count)
+def normalize_phase12_case(raw_case):
+    if isinstance(raw_case, str):
+        raw_case = {
+            "case_dir": raw_case,
+            "label": raw_case,
+        }
 
+    case_dir = str(raw_case["case_dir"])
+    case_id = str(raw_case.get("case_id", os.path.basename(os.path.normpath(case_dir))))
+    if case_id.startswith("g"):
+        case_id = case_id[1:]
 
-def suffix_to_rmicro(sfx: str) -> float:
-    if not sfx:
-        return np.nan
-    match = re.match(r"([+-]?(?:\d+(?:\.\d*)?|\.\d+))", sfx)
-    if match is None:
-        return np.nan
-    return float(match.group(1)) / 100.0
-
-
-def build_case_base(geom: str, suffix: str = "") -> str:
-    case = f"g{geom}"
-    if suffix:
-        case += f"_r{suffix}"
-    return case
-
-
-def build_case_name(geom: str, suffix: str = "", dye: str = "") -> str:
-    case = build_case_base(geom, suffix)
-    if dye:
-        case += f"_d{dye}"
-    return case
-
-
-def build_plot_stem(prefix: str, geom: str, dye: str = "") -> str:
-    stem = f"{prefix}_{geom}"
-    if dye:
-        stem += f"_d{dye}"
-    return stem
+    spec = {
+        "geom": str(raw_case.get("geom", case_id)),
+        "run_suffix": str(raw_case.get("run_suffix", "")),
+        "dye": str(raw_case.get("dye", "")),
+        "case_dir": case_dir,
+        "child_folder": str(raw_case.get("child_folder", DEFAULT_CHILD_FOLDER)),
+        "label": str(raw_case.get("label", case_dir)),
+    }
+    if raw_case.get("step_override") is not None:
+        spec["step_override"] = int(raw_case["step_override"])
+    if raw_case.get("time_override") is not None:
+        spec["time_override"] = float(raw_case["time_override"])
+    return spec
 
 
 def build_extract_case_specs():
-    case_specs = []
-
-    for geom in RUN_GEOMETRIES:
-        suffixes = RUN_SUFFIXES.get(geom)
-        if suffixes is None:
-            raise KeyError(f"No RUN_SUFFIXES configured for geometry {geom}")
-
-        for suffix in suffixes:
-            for dye in DYES:
-                case_name = build_case_name(geom, suffix, dye)
-                case_base = build_case_base(geom, suffix)
-                case_dir = CASE_DIR_OVERRIDES.get(
-                    case_name,
-                    CASE_DIR_OVERRIDES.get(case_base, case_name),
-                )
-                child_folder = CHILD_FOLDER_OVERRIDES.get(
-                    case_name,
-                    CHILD_FOLDER_OVERRIDES.get(case_base, DEFAULT_CHILD_FOLDER),
-                )
-                case_specs.append({
-                    "geom": geom,
-                    "run_suffix": suffix,
-                    "dye": dye,
-                    "case_dir": case_dir,
-                    "child_folder": child_folder,
-                })
-
-    return case_specs
+    return add_output_paths_to_case_specs(
+        [normalize_phase12_case(case) for case in CASES],
+        BASE,
+        tag_output_folder=TAG_OUTPUT_FOLDER,
+        concentration_subdir=CONCENTRATION_SUBDIR,
+    )
 
 
-def resolve_existing_path(path_config):
-    if isinstance(path_config, (list, tuple)):
-        for path in path_config:
-            if os.path.exists(path):
-                return path
-        raise FileNotFoundError(f"Could not find any configured path in {path_config}")
-    return path_config
+def build_phase3_case_specs():
+    return add_output_paths_to_case_specs(
+        expand_case_specs(
+            RUN_GEOMETRIES,
+            RUN_SUFFIXES,
+            DYES,
+            default_child_folder=DEFAULT_CHILD_FOLDER,
+            case_dir_overrides=CASE_DIR_OVERRIDES,
+            child_folder_overrides=CHILD_FOLDER_OVERRIDES,
+        ),
+        BASE,
+        tag_output_folder=TAG_OUTPUT_FOLDER,
+        concentration_subdir=CONCENTRATION_SUBDIR,
+    )
+
+
+_CASE_SPECS_CACHE = None
+_PHASE3_CASE_SPECS_CACHE = None
+
+
+def get_case_specs():
+    global _CASE_SPECS_CACHE
+    if _CASE_SPECS_CACHE is None:
+        _CASE_SPECS_CACHE = build_extract_case_specs()
+    return _CASE_SPECS_CACHE
+
+
+def get_phase3_case_specs():
+    global _PHASE3_CASE_SPECS_CACHE
+    if _PHASE3_CASE_SPECS_CACHE is None:
+        _PHASE3_CASE_SPECS_CACHE = build_phase3_case_specs()
+    return _PHASE3_CASE_SPECS_CACHE
+
+
+def case_spec_key(geom: str, suffix: str, dye: str):
+    return (str(geom), str(suffix), str(dye))
+
+
+def get_phase3_case_spec(geom: str, suffix: str, dye: str):
+    key = case_spec_key(geom, suffix, dye)
+    case_specs = {
+        case_spec_key(spec["geom"], spec["run_suffix"], spec["dye"]): spec
+        for spec in get_phase3_case_specs()
+    }
+    if key not in case_specs:
+        raise KeyError(f"No phase-3 case spec configured for geom={geom}, suffix={suffix}, dye={dye}")
+    return case_specs[key]
+
+
+def concentration_csv_for_case_spec(spec, full_series: bool = False):
+    return concentration_csv_path(
+        spec["concentration_dir"],
+        spec["geom"],
+        spec["run_suffix"],
+        spec["dye"],
+        full_series=full_series,
+    )
+
+
+def concentration_csv_for_phase3_case(geom: str, suffix: str, dye: str, full_series: bool = False):
+    return concentration_csv_for_case_spec(
+        get_phase3_case_spec(geom, suffix, dye),
+        full_series=full_series,
+    )
+
+
+def output_dir_for_case_spec(spec, *subdirs):
+    return os.path.join(spec["tag_dir"], *subdirs)
+
+
+def output_dir_for_phase3_geom_dye(geom: str, dye: str, *subdirs):
+    suffixes = RUN_SUFFIXES.get(geom, [])
+    if not suffixes:
+        raise KeyError(f"No run suffixes configured for geometry {geom}")
+    spec = get_phase3_case_spec(geom, suffixes[0], dye)
+    return output_dir_for_case_spec(spec, *subdirs)
+
+
+def case_display_name(spec):
+    return spec.get("label") or build_case_name(spec["geom"], spec["run_suffix"], spec["dye"])
+
+
+def tag_plot_stem(dye: str = ""):
+    return "tag" if not dye else f"tag_d{dye}"
 
 
 def load_arc_values(path_config):
@@ -239,15 +281,6 @@ def load_centerline_profile(df: pd.DataFrame, n_arc: int) -> pd.DataFrame:
     return prof
 
 
-def format_suffix_label(geom: str, suffix: str) -> str:
-    if not suffix:
-        return build_case_base(geom, suffix)
-    r_value = suffix_to_rmicro(suffix)
-    if np.isfinite(r_value):
-        return f"R_micro = {r_value:.2f}"
-    return build_case_base(geom, suffix)
-
-
 def sort_suffixes(suffixes):
     def sort_key(sfx):
         if not sfx:
@@ -258,14 +291,6 @@ def sort_suffixes(suffixes):
         return (2, float("inf"), sfx)
 
     return sorted(suffixes, key=sort_key)
-
-
-def make_geom_cmap(geom_index: int):
-    # kept for backward compatibility; not used for Phase 2 anymore
-    if geom_index == 1:
-        return plt.get_cmap("BuPu")
-    else:
-        return plt.get_cmap("OrRd")
 
 
 def phase1_extract():
@@ -296,21 +321,6 @@ def phase1_extract():
     print("[PHASE 1] done.")
 
 
-def _conc_csv_path(geom: str, suffix: str, dye: str, full_series: bool = False) -> str:
-    """
-    Build path like:
-    BASE/concentrations/g13_r43_dB_concentration.csv
-    or, for no suffix / no dye cases:
-    BASE/concentrations/g80_concentration.csv
-    """
-    case_name = build_case_name(geom, suffix, dye)
-    if full_series:
-        fname = f"{case_name}_concentration_timeseries.csv"
-    else:
-        fname = f"{case_name}_concentration.csv"
-    return os.path.join(CONC_DIR, fname)
-
-
 def phase2_animation_enabled() -> bool:
     return PHASE2_ANIMATION_TIME_RANGE is not None
 
@@ -330,11 +340,11 @@ def first_existing_column(columns, candidates):
     return next((col for col in candidates if col in columns), None)
 
 
-def load_time_series_profiles(geom: str, suffix: str, dye: str, arc_all):
-    case_dye = build_case_name(geom, suffix, dye)
-    csv_path = _conc_csv_path(geom, suffix, dye, full_series=True)
+def load_time_series_profiles(case_spec, arc_all):
+    case_label = case_display_name(case_spec)
+    csv_path = concentration_csv_for_case_spec(case_spec, full_series=True)
     if not os.path.exists(csv_path):
-        print(f"  [WARN] {csv_path} not found, skipping {case_dye}")
+        print(f"  [WARN] {csv_path} not found, skipping {case_label}")
         return []
 
     df = pd.read_csv(csv_path)
@@ -400,6 +410,63 @@ def outputs_exist(paths) -> bool:
     return all(os.path.exists(path) for path in paths)
 
 
+def animation_metadata_path(animation_output_dir: str):
+    return os.path.join(animation_output_dir, PHASE2_ANIMATION_METADATA_CSV)
+
+
+def load_saved_animation_group_max(animation_output_dir: str):
+    metadata_path = animation_metadata_path(animation_output_dir)
+    if not os.path.exists(metadata_path):
+        return None
+
+    with open(metadata_path, "r", newline="") as f:
+        reader = csv.DictReader(f)
+        row = next(reader, None)
+
+    if row is None or "group_max" not in row:
+        return None
+
+    try:
+        return float(row["group_max"])
+    except (TypeError, ValueError):
+        return None
+
+
+def write_animation_group_max(animation_output_dir: str, group_max: float):
+    metadata_path = animation_metadata_path(animation_output_dir)
+    with open(metadata_path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=["group_max"])
+        writer.writeheader()
+        writer.writerow({"group_max": f"{group_max:.17g}"})
+
+
+def has_existing_animation_frame_files(animation_output_dir: str):
+    frame_extensions = tuple(f".{fmt.lower()}" for fmt in PHASE2_OUTPUT_FORMATS)
+    for name in os.listdir(animation_output_dir):
+        path = os.path.join(animation_output_dir, name)
+        if os.path.isfile(path) and name.lower().endswith(frame_extensions):
+            return True
+    return False
+
+
+def animation_group_max_is_stale(animation_output_dir: str, group_max: float):
+    saved_group_max = load_saved_animation_group_max(animation_output_dir)
+    if saved_group_max is None:
+        if has_existing_animation_frame_files(animation_output_dir):
+            print("  [INFO] Existing animation frames have no group_max metadata; regenerating.")
+            return True
+        return False
+
+    if np.isclose(saved_group_max, group_max, rtol=1.0e-12, atol=1.0e-12):
+        return False
+
+    print(
+        "  [INFO] Animation group_max changed "
+        f"from {saved_group_max:.12g} to {group_max:.12g}; regenerating frames."
+    )
+    return True
+
+
 def save_figure_in_formats(fig, directory: str, stem: str, formats, dpi: int, transparent: bool = True):
     for fmt in formats:
         out_path = os.path.join(directory, f"{stem}.{fmt}")
@@ -439,13 +506,13 @@ def apply_phase2_clean_mode(ax1, ax2):
                 ax2.spines[spine].set_visible(False)
 
 
-def archive_existing_animation_frames():
-    archive_dir = os.path.join(PHASE2_ANIMATION_OUTPUT_DIR, "_ss")
+def archive_existing_animation_frames(animation_output_dir: str):
+    archive_dir = os.path.join(animation_output_dir, "_ss")
     os.makedirs(archive_dir, exist_ok=True)
 
     moved_count = 0
-    for name in os.listdir(PHASE2_ANIMATION_OUTPUT_DIR):
-        src_path = os.path.join(PHASE2_ANIMATION_OUTPUT_DIR, name)
+    for name in os.listdir(animation_output_dir):
+        src_path = os.path.join(animation_output_dir, name)
         if name == "_ss" or not os.path.isfile(src_path):
             continue
 
@@ -467,175 +534,161 @@ def archive_existing_animation_frames():
         print(f"[PHASE 2] archived {moved_count} existing frame(s) to {archive_dir}")
 
 
+def maybe_print_frame_progress(processed, total, saved, skipped, force=False):
+    if total <= 0:
+        return
+    if not force and processed % PHASE2_FRAME_PROGRESS_EVERY != 0:
+        return
+    print(
+        f"  [PROGRESS] Frames {processed}/{total} processed; "
+        f"saved={saved}, skipped={skipped}",
+        flush=True,
+    )
+
+
 def phase2_save_animation_frames():
     print("[PHASE 2] saving animation frames")
-    os.makedirs(PHASE2_ANIMATION_OUTPUT_DIR, exist_ok=True)
-    if OVERWRITE_EXISTING:
-        archive_existing_animation_frames()
     t_start, t_end = _phase2_animation_time_bounds()
     print(f"[PHASE 2] time range = [{t_start}, {t_end}]")
+    arc_all = load_arc_values(ARC_PATH)
+    case_specs = get_case_specs()
+    cmap = plt.get_cmap("BuPu")
+    color = cmap((PHASE2_BUPU_RANGE[0] + PHASE2_BUPU_RANGE[1]) / 2.0)
 
-    for geom in RUN_GEOMETRIES:
-        print(f"[PHASE 2] geometry g{geom}")
-        arc_all = load_arc_values(ARC_PATHS[geom])
-        suffixes = RUN_SUFFIXES[geom]
-        ordered = sort_suffixes(suffixes)
+    for case_spec in case_specs:
+        case_label = case_display_name(case_spec)
+        dye = case_spec.get("dye", "")
+        print(f"[PHASE 2] case {case_label}")
+        animation_output_dir = output_dir_for_case_spec(case_spec, PHASE2_ANIMATION_SUBDIR)
+        os.makedirs(animation_output_dir, exist_ok=True)
+        if OVERWRITE_EXISTING:
+            archive_existing_animation_frames(animation_output_dir)
 
-        cmap = plt.get_cmap("BuPu")
-        c_levels = make_cmap_levels(PHASE2_BUPU_RANGE, len(ordered))
-        suffix_to_color = {
-            sfx: cmap(level)
-            for sfx, level in zip(ordered, c_levels)
-        }
+        frames = select_time_range_frames(load_time_series_profiles(case_spec, arc_all))
+        if not frames:
+            print(f"  [WARN] no frames found in range for {case_label}")
+            continue
 
-        for dye in DYES:
-            print(f"[PHASE 2]  dye {dye}")
-            series_frames = {}
-            group_max = 0.0
-            velocity_max = 0.0
-            frame_catalog = {}
+        group_max = max(float(np.nanmax(frame["conc"])) for frame in frames)
+        velocity_max = 0.0
+        if PLOT_VELOCITY:
+            for frame in frames:
+                if all(col in frame["prof"].columns for col in ["Velocity:0", "Velocity:1", "Velocity:2"]):
+                    vel_mag = np.sqrt(
+                        frame["prof"]["Velocity:0"] ** 2 +
+                        frame["prof"]["Velocity:1"] ** 2 +
+                        frame["prof"]["Velocity:2"] ** 2
+                    ).to_numpy()
+                    velocity_max = max(velocity_max, float(np.nanmax(vel_mag)))
 
-            for suffix in suffixes:
-                case_base = build_case_base(geom, suffix)
-                case_dye = build_case_name(geom, suffix, dye)
-                frames = load_time_series_profiles(geom, suffix, dye, arc_all)
-                frames = select_time_range_frames(frames)
-                if not frames:
-                    print(f"  [WARN] no frames found in range for {case_dye}")
+        if group_max <= 0:
+            print(f"  [WARN] non-positive concentration max across selected range for {case_label}")
+            continue
+
+        if not OVERWRITE_EXISTING and animation_group_max_is_stale(animation_output_dir, group_max):
+            archive_existing_animation_frames(animation_output_dir)
+
+        write_animation_group_max(animation_output_dir, group_max)
+
+        y_top = 1.0 if NORMALIZE_CONC else group_max * 1.02
+        frames = sorted(frames, key=lambda frame: frame["time"])
+        total_frames = len(frames)
+        saved_frames = 0
+        skipped_frames = 0
+        print(f"  [INFO] saving {total_frames} frames to {animation_output_dir}")
+
+        with plt.rc_context({
+            "font.size": PHASE2_FONTSIZE,
+            "axes.labelsize": PHASE2_FONTSIZE,
+            "xtick.labelsize": PHASE2_FONTSIZE,
+            "ytick.labelsize": PHASE2_FONTSIZE,
+            "legend.fontsize": max(6, PHASE2_FONTSIZE - 2),
+        }):
+            for frame_index, frame in enumerate(frames):
+                frame_time = frame["time"]
+                stem = tag_plot_stem(dye)
+                frame_stem = f"{stem}_frame_{frame_index:04d}_t{format_time_token(frame_time)}"
+                out_paths = build_output_paths(
+                    animation_output_dir, frame_stem, PHASE2_OUTPUT_FORMATS
+                )
+                processed_frames = frame_index + 1
+                if outputs_exist(out_paths) and not OVERWRITE_EXISTING:
+                    skipped_frames += 1
+                    maybe_print_frame_progress(
+                        processed_frames,
+                        total_frames,
+                        saved_frames,
+                        skipped_frames,
+                        force=processed_frames == total_frames,
+                    )
                     continue
 
-                frame_map = {}
-                for frame in frames:
-                    frame_map[frame["frame_key"]] = frame
-                    frame_catalog[frame["frame_key"]] = frame["time"]
+                fig, ax1 = plt.subplots(figsize=FIGSIZE_PHASE2)
+                ax2 = ax1.twinx() if PLOT_VELOCITY else None
 
-                    conc_max = float(np.nanmax(frame["conc"]))
-                    if conc_max > group_max:
-                        group_max = conc_max
+                conc = frame["conc"]
+                prof = frame["prof"]
+                x_arc = frame["x_arc"]
+                conc_plot = conc / group_max if NORMALIZE_CONC and group_max > 0 else conc
 
-                    if PLOT_VELOCITY and all(
-                        col in frame["prof"].columns for col in ["Velocity:0", "Velocity:1", "Velocity:2"]
-                    ):
+                ax1.plot(
+                    x_arc,
+                    conc_plot,
+                    label=case_label,
+                    alpha=1.0,
+                    color=color,
+                    linewidth=3,
+                )
+
+                if PLOT_VELOCITY and ax2 is not None:
+                    if all(col in prof.columns for col in ["Velocity:0", "Velocity:1", "Velocity:2"]):
                         vel_mag = np.sqrt(
-                            frame["prof"]["Velocity:0"] ** 2 +
-                            frame["prof"]["Velocity:1"] ** 2 +
-                            frame["prof"]["Velocity:2"] ** 2
-                        ).to_numpy()
-                        vel_frame_max = float(np.nanmax(vel_mag))
-                        if vel_frame_max > velocity_max:
-                            velocity_max = vel_frame_max
-
-                series_frames[suffix] = {
-                    "case_base": case_base,
-                    "case_dye": case_dye,
-                    "frames": frame_map,
-                }
-
-            if not series_frames:
-                print(f"  [WARN] no time-series data available for geometry g{geom}, dye {dye}")
-                continue
-
-            if group_max <= 0:
-                print(f"  [WARN] non-positive concentration max across selected range for g{geom}, dye {dye}")
-                continue
-
-            y_top = 1.0 if NORMALIZE_CONC else group_max * 1.02
-            frame_keys = sorted(frame_catalog, key=lambda key: frame_catalog[key])
-            print(f"  [INFO] saving {len(frame_keys)} frames to {PHASE2_ANIMATION_OUTPUT_DIR}")
-
-            with plt.rc_context({
-                "font.size": PHASE2_FONTSIZE,
-                "axes.labelsize": PHASE2_FONTSIZE,
-                "xtick.labelsize": PHASE2_FONTSIZE,
-                "ytick.labelsize": PHASE2_FONTSIZE,
-                "legend.fontsize": max(6, PHASE2_FONTSIZE - 2),
-            }):
-                for frame_index, frame_key in enumerate(frame_keys):
-                    frame_time = frame_catalog[frame_key]
-                    stem = build_plot_stem("tag", geom, dye)
-                    frame_stem = f"{stem}_frame_{frame_index:04d}_t{format_time_token(frame_time)}"
-                    out_paths = build_output_paths(
-                        PHASE2_ANIMATION_OUTPUT_DIR, frame_stem, PHASE2_OUTPUT_FORMATS
-                    )
-                    if outputs_exist(out_paths) and not OVERWRITE_EXISTING:
-                        print(f"  [SKIP] frame already exists: {frame_stem}")
-                        continue
-
-                    fig, ax1 = plt.subplots(figsize=FIGSIZE_PHASE2)
-                    ax2 = ax1.twinx() if PLOT_VELOCITY else None
-
-                    for suffix in suffixes:
-                        if suffix not in series_frames:
-                            continue
-                        frame = series_frames[suffix]["frames"].get(frame_key)
-                        if frame is None:
-                            continue
-
-                        color = suffix_to_color[suffix]
-                        conc = frame["conc"]
-                        prof = frame["prof"]
-                        x_arc = frame["x_arc"]
-                        if NORMALIZE_CONC and group_max > 0:
-                            conc_plot = conc / group_max
-                        else:
-                            conc_plot = conc
-
-                        ax1.plot(
-                            x_arc, conc_plot,
-                            label=series_frames[suffix]["case_base"],
-                            alpha=1.0,
-                            color=color,
-                            linewidth=3,
+                            prof["Velocity:0"] ** 2 +
+                            prof["Velocity:1"] ** 2 +
+                            prof["Velocity:2"] ** 2
                         )
+                        ax2.plot(x_arc, vel_mag, linestyle=":", color=color, linewidth=2)
 
-                        if PLOT_VELOCITY and ax2 is not None:
-                            if all(col in prof.columns for col in ["Velocity:0", "Velocity:1", "Velocity:2"]):
-                                vel_mag = np.sqrt(
-                                    prof["Velocity:0"] ** 2 +
-                                    prof["Velocity:1"] ** 2 +
-                                    prof["Velocity:2"] ** 2
-                                )
-                                ax2.plot(x_arc, vel_mag, linestyle=":", color=color, linewidth=2)
+                ax1.set_xlabel("Centerline length [cm]")
+                label_y = "Concentration" + (" (normalized)" if NORMALIZE_CONC else "")
+                ax1.set_ylabel(label_y)
+                if PLOT_VELOCITY and ax2 is not None:
+                    ax2.set_ylabel("Velocity magnitude")
+                    if velocity_max > 0:
+                        ax2.set_ylim(0, velocity_max * 1.02)
 
-                    ax1.set_xlabel("Centerline length [cm]")
-                    label_y = "Concentration" + (" (normalized to range max)" if NORMALIZE_CONC else "")
-                    ax1.set_ylabel(label_y)
-                    if PLOT_VELOCITY and ax2 is not None:
-                        ax2.set_ylabel("Velocity magnitude")
-                        if velocity_max > 0:
-                            ax2.set_ylim(0, velocity_max * 1.02)
+                ax1.set_ylim(0, y_top)
+                ax1.set_xlim(left=0)
 
-                    ax1.set_ylim(0, y_top)
-                    ax1.set_xlim(left=0)
+                if PHASE2_LEGEND:
+                    ax1.legend(loc="best")
 
-                    handles = [
-                        Line2D([0], [0], color=suffix_to_color[sfx], lw=3,
-                               label=format_suffix_label(geom, sfx))
-                        for sfx in ordered
-                        if sfx in series_frames
-                    ]
-                    if PHASE2_LEGEND and handles:
-                        ax1.legend(handles=handles, loc="best")
+                if PLOT_TITLES:
+                    ax1.set_title(f"{case_label}  t = {frame_time:.4f}")
 
-                    geom_name = GEOM_LABELS.get(geom, f"g{geom}")
-                    dye_name = DYE_LABELS.get(dye, dye or "no dye label")
-                    if PLOT_TITLES:
-                        title = geom_name if not dye else f"{geom_name}, {dye_name}"
-                        ax1.set_title(f"{title}  t = {frame_time:.4f}")
+                if PHASE2_CLEAN:
+                    apply_phase2_clean_mode(ax1, ax2)
 
-                    if PHASE2_CLEAN:
-                        apply_phase2_clean_mode(ax1, ax2)
+                fig.tight_layout()
+                save_figure_in_formats(
+                    fig,
+                    animation_output_dir,
+                    frame_stem,
+                    PHASE2_OUTPUT_FORMATS,
+                    dpi=PHASE2_ANIMATION_DPI,
+                    transparent=True,
+                )
+                plt.close(fig)
+                saved_frames += 1
+                maybe_print_frame_progress(
+                    processed_frames,
+                    total_frames,
+                    saved_frames,
+                    skipped_frames,
+                    force=processed_frames == total_frames,
+                )
 
-                    fig.tight_layout()
-                    save_figure_in_formats(
-                        fig,
-                        PHASE2_ANIMATION_OUTPUT_DIR,
-                        frame_stem,
-                        PHASE2_OUTPUT_FORMATS,
-                        dpi=PHASE2_ANIMATION_DPI,
-                        transparent=True,
-                    )
-                    plt.close(fig)
+        write_animation_group_max(animation_output_dir, group_max)
 
     print("[PHASE 2] animation frames done.")
 
@@ -657,7 +710,7 @@ def compute_tag_threshold_for_geom(geom: str, dye: str, threshold: float = 0.1):
       - y_fit_norm       : fitted normalized values
       - group_max        : max concentration over all suffixes in this (geom, dye) group
     """
-    arc_all = load_arc_values(ARC_PATHS[geom])
+    arc_all = load_arc_values(ARC_PATH)
     n_arc = len(arc_all)
 
     temp_entries = []
@@ -667,7 +720,7 @@ def compute_tag_threshold_for_geom(geom: str, dye: str, threshold: float = 0.1):
     for suffix in RUN_SUFFIXES[geom]:
         case_base = build_case_base(geom, suffix)
         case_dye = build_case_name(geom, suffix, dye)
-        csv_path = _conc_csv_path(geom, suffix, dye)
+        csv_path = concentration_csv_for_phase3_case(geom, suffix, dye)
 
         if not os.path.exists(csv_path):
             print(f"  [WARN] {csv_path} not found, skipping {case_dye}")
@@ -808,196 +861,121 @@ def phase2_plot_concentration():
         return
 
     print("[PHASE 2] plotting concentration (and maybe velocity)")
+    arc_all = load_arc_values(ARC_PATH)
+    n_arc = len(arc_all)
+    cmap = plt.get_cmap("BuPu")
+    color = cmap((PHASE2_BUPU_RANGE[0] + PHASE2_BUPU_RANGE[1]) / 2.0)
 
-    for geom in RUN_GEOMETRIES:
-        print(f"[PHASE 2] geometry g{geom}")
+    for case_spec in get_case_specs():
+        case_label = case_display_name(case_spec)
+        dye = case_spec.get("dye", "")
+        print(f"[PHASE 2] case {case_label}")
 
-        # arc-length for this geometry
-        arc_all = load_arc_values(ARC_PATHS[geom])
-        n_arc = len(arc_all)
+        csv_path = concentration_csv_for_case_spec(case_spec)
+        if not os.path.exists(csv_path):
+            print(f"  [WARN] {csv_path} not found, skipping {case_label}")
+            continue
 
-        suffixes = RUN_SUFFIXES[geom]
-        ordered = sort_suffixes(suffixes)
+        prof_all = pd.read_csv(csv_path)
+        if "Concentration" not in prof_all.columns:
+            print(f"  [WARN] no 'Concentration' column in {csv_path}, skipping")
+            continue
 
-        # Use BuPu for ALL concentration plots
-        cmap = plt.get_cmap("BuPu")
-        c_levels = make_cmap_levels(PHASE2_BUPU_RANGE, len(ordered))
-        suffix_to_color = {
-            sfx: cmap(level)
-            for sfx, level in zip(ordered, c_levels)
-        }
+        prof = load_centerline_profile(prof_all, n_arc)
+        conc = prof["Concentration"].to_numpy()
+        if conc.size == 0:
+            print(f"  [WARN] empty concentration profile for {case_label}, skipping")
+            continue
 
-        for dye in DYES:
-            print(f"[PHASE 2]  dye {dye}")
+        group_max = float(np.nanmax(conc))
+        print(f"  {case_label}: C_max_snapshot={group_max}")
+        x_arc = arc_all[:len(conc)]
 
-            # TAG rows (raw concentrations, used only for fit overlay)
-            tag_rows = compute_tag_threshold_for_geom(geom, dye, threshold=THRESHOLD)
-            tag_map = {row["case_dye"]: row for row in tag_rows}
+        with plt.rc_context({
+            "font.size": PHASE2_FONTSIZE,
+            "axes.labelsize": PHASE2_FONTSIZE,
+            "xtick.labelsize": PHASE2_FONTSIZE,
+            "ytick.labelsize": PHASE2_FONTSIZE,
+            "legend.fontsize": max(6, PHASE2_FONTSIZE - 2),
+        }):
+            fig, ax1 = plt.subplots(figsize=FIGSIZE_PHASE2)
+            ax2 = ax1.twinx() if PLOT_VELOCITY else None
 
-            # --------------------------------------------------------
-            # FIRST PASS: load all profiles and find group_max per geom+dye
-            # --------------------------------------------------------
-            conc_data = {}   # suffix -> dict with conc, x_arc, prof, c_max
-            group_max = 0.0
+            conc_plot = conc / group_max if NORMALIZE_CONC and group_max > 0 else conc
+            ax1.plot(
+                x_arc,
+                conc_plot,
+                label=case_label,
+                alpha=1.0,
+                color=color,
+                linewidth=3,
+            )
 
-            for suffix in suffixes:
-                case_base = build_case_base(geom, suffix)
-                case_dye = build_case_name(geom, suffix, dye)
-                csv_path = _conc_csv_path(geom, suffix, dye)
-
-                if not os.path.exists(csv_path):
-                    print(f"  [WARN] {csv_path} not found, skipping {case_dye}")
-                    continue
-
-                prof_all = pd.read_csv(csv_path)
-                if "Concentration" not in prof_all.columns:
-                    print(f"  [WARN] no 'Concentration' column in {csv_path}, skipping")
-                    continue
-
-                # treat entire file as single snapshot along centerline, re-oriented if needed
-                prof = load_centerline_profile(prof_all, n_arc)
-                conc = prof["Concentration"].to_numpy()
-                if conc.size == 0:
-                    print(f"  [WARN] empty concentration profile for {case_dye}, skipping")
-                    continue
-
-                c_max = float(conc.max())
-                print(f"  {case_dye}: C_max_snapshot={c_max}")
-
-                x_arc = arc_all[:len(conc)]
-                conc_data[suffix] = {
-                    "case_base": case_base,
-                    "case_dye": case_dye,
-                    "x_arc": x_arc,
-                    "conc": conc,
-                    "prof": prof,
-                }
-
-                if c_max > group_max:
-                    group_max = c_max
-
-            if not conc_data:
-                print(f"  [WARN] no valid profiles for geometry g{geom}, dye {dye}")
-                continue
-
-            # --------------------------------------------------------
-            # SECOND PASS: plot using per-(geom,dye) group_max
-            # --------------------------------------------------------
-            with plt.rc_context({
-                "font.size": PHASE2_FONTSIZE,
-                "axes.labelsize": PHASE2_FONTSIZE,
-                "xtick.labelsize": PHASE2_FONTSIZE,
-                "ytick.labelsize": PHASE2_FONTSIZE,
-                "legend.fontsize": max(6, PHASE2_FONTSIZE - 2),
-            }):
-                fig, ax1 = plt.subplots(figsize=FIGSIZE_PHASE2)
-                ax2 = ax1.twinx() if PLOT_VELOCITY else None
-
-                for suffix in suffixes:
-                    if suffix not in conc_data:
-                        continue
-
-                    data = conc_data[suffix]
-                    case_base = data["case_base"]
-                    case_dye = data["case_dye"]
-                    x_arc = data["x_arc"]
-                    conc = data["conc"]
-                    prof = data["prof"]
-                    color = suffix_to_color[suffix]
-
-                    if NORMALIZE_CONC and group_max > 0:
-                        conc_plot = conc / group_max
-                    else:
-                        conc_plot = conc
-
-                    ax1.plot(
-                        x_arc, conc_plot,
-                        label=case_base,
-                        alpha=1.0,
-                        color=color,
-                        linewidth=3
+            if PLOT_VELOCITY and ax2 is not None:
+                if all(col in prof.columns for col in ["Velocity:0", "Velocity:1", "Velocity:2"]):
+                    vel_mag = np.sqrt(
+                        prof["Velocity:0"]**2 +
+                        prof["Velocity:1"]**2 +
+                        prof["Velocity:2"]**2
                     )
-
-                    if PLOT_VELOCITY and ax2 is not None:
-                        if all(col in prof.columns for col in ["Velocity:0", "Velocity:1", "Velocity:2"]):
-                            vel_mag = np.sqrt(
-                                prof["Velocity:0"]**2 +
-                                prof["Velocity:1"]**2 +
-                                prof["Velocity:2"]**2
-                            )
-                            ax2.plot(x_arc, vel_mag, linestyle=":", color=color, linewidth=2)
-                        else:
-                            print(f"  [WARN] velocity columns missing for {case_dye}, skipping velocity plot")
-
-                    # overlay TAG fit (computed in raw units, scaled here if normalized)
-                    if case_dye in tag_map:
-                        x_seg = tag_map[case_dye]["x_seg"]
-                        y_fit = tag_map[case_dye]["y_fit"]
-                        if NORMALIZE_CONC and group_max > 0:
-                            y_fit_plot = y_fit / group_max
-                        else:
-                            y_fit_plot = y_fit
-                        ax1.plot(x_seg, y_fit_plot, linestyle="--", color=color, linewidth=0.01)
-                ax1.set_xlabel("Centerline length [cm]")
-                label_y = "Concentration" + (" (normalized)" if NORMALIZE_CONC else "")
-                ax1.set_ylabel(label_y)
-                if PLOT_VELOCITY and ax2 is not None:
-                    ax2.set_ylabel("Velocity magnitude")
-                ax1.set_ylim(bottom=0)
-                if NORMALIZE_CONC:
-                    ax1.set_ylim(top=1)
-                ax1.set_xlim(left=0)
-
-                # legend keyed by R_micro
-                handles = [
-                    Line2D([0], [0], color=suffix_to_color[sfx], lw=3,
-                           label=format_suffix_label(geom, sfx))
-                    for sfx in ordered
-                ]
-                if PHASE2_LEGEND:
-                    ax1.legend(handles=handles, loc="best")
-
-                # Title: geom label + dye
-                geom_name = GEOM_LABELS.get(geom, f"g{geom}")
-                dye_name = DYE_LABELS.get(dye, dye or "no dye label")
-                if PLOT_TITLES:
-                    title = geom_name if not dye else f"{geom_name}, {dye_name}"
-                    ax1.set_title(title)
-                # ------------------------------------------------------------
-                # PHASE 2 CLEAN MODE (for inset usage)
-                # ------------------------------------------------------------
-                if PHASE2_CLEAN:
-                    apply_phase2_clean_mode(ax1, ax2)
-                fig.tight_layout()
-                out_name = f"{build_plot_stem('tag', geom, dye)}.svg"
-                if NORMALIZE_CONC:
-                    plt.savefig(
-                        f"/Users/tejjolly/Documents/BioSimm/Meetings/2025-11-20--research_update/figures/normalized/{out_name}",
-                        format="svg", transparent=True, dpi=600
-                    )
+                    ax2.plot(x_arc, vel_mag, linestyle=":", color=color, linewidth=2)
                 else:
-                    plt.savefig(
-                        f"/Users/tejjolly/Documents/BioSimm/Meetings/2025-11-20--research_update/figures/non-normalized/{out_name}",
-                        format="svg", transparent=True, dpi=600
+                    print(f"  [WARN] velocity columns missing for {case_label}, skipping velocity plot")
+
+            ax1.set_xlabel("Centerline length [cm]")
+            label_y = "Concentration" + (" (normalized)" if NORMALIZE_CONC else "")
+            ax1.set_ylabel(label_y)
+            if PLOT_VELOCITY and ax2 is not None:
+                ax2.set_ylabel("Velocity magnitude")
+            ax1.set_ylim(bottom=0)
+            if NORMALIZE_CONC:
+                ax1.set_ylim(top=1)
+            ax1.set_xlim(left=0)
+
+            if PHASE2_LEGEND:
+                ax1.legend(loc="best")
+
+            if PLOT_TITLES:
+                ax1.set_title(case_label)
+
+            if PHASE2_CLEAN:
+                apply_phase2_clean_mode(ax1, ax2)
+
+            fig.tight_layout()
+            scale_subdir = "normalized" if NORMALIZE_CONC else "non-normalized"
+            static_output_dir = output_dir_for_case_spec(
+                case_spec,
+                PHASE2_STATIC_SUBDIR,
+                scale_subdir,
+            )
+            os.makedirs(static_output_dir, exist_ok=True)
+            out_name = f"{tag_plot_stem(dye)}.svg"
+            plt.savefig(
+                os.path.join(static_output_dir, out_name),
+                format="svg",
+                transparent=True,
+                dpi=600,
+            )
+            if phase2_manual_snapshot_enabled():
+                manual_snapshot_dir = output_dir_for_case_spec(
+                    case_spec,
+                    PHASE2_MANUAL_SNAPSHOT_SUBDIR,
+                )
+                os.makedirs(manual_snapshot_dir, exist_ok=True)
+                manual_stem = f"{tag_plot_stem(dye)}_t{format_time_token(PHASE1_MANUAL_TIME)}"
+                manual_out_paths = build_output_paths(
+                    manual_snapshot_dir, manual_stem, PHASE2_OUTPUT_FORMATS
+                )
+                if OVERWRITE_EXISTING or not outputs_exist(manual_out_paths):
+                    save_figure_in_formats(
+                        fig,
+                        manual_snapshot_dir,
+                        manual_stem,
+                        PHASE2_OUTPUT_FORMATS,
+                        dpi=PHASE2_ANIMATION_DPI,
+                        transparent=True,
                     )
-                if phase2_manual_snapshot_enabled():
-                    os.makedirs(PHASE2_MANUAL_SNAPSHOT_DIR, exist_ok=True)
-                    manual_stem = (
-                        f"{build_plot_stem('tag', geom, dye)}_t{format_time_token(PHASE1_MANUAL_TIME)}"
-                    )
-                    manual_out_paths = build_output_paths(
-                        PHASE2_MANUAL_SNAPSHOT_DIR, manual_stem, PHASE2_OUTPUT_FORMATS
-                    )
-                    if OVERWRITE_EXISTING or not outputs_exist(manual_out_paths):
-                        save_figure_in_formats(
-                            fig,
-                            PHASE2_MANUAL_SNAPSHOT_DIR,
-                            manual_stem,
-                            PHASE2_OUTPUT_FORMATS,
-                            dpi=PHASE2_ANIMATION_DPI,
-                            transparent=True,
-                        )
-                plt.show()
+            plt.show()
 
     print("[PHASE 2] done.")
 
@@ -1036,9 +1014,13 @@ def phase3_calc_tafe_and_plot_hmr():
         return
 
     # --- output directory / labels depending on normalized toggle ---
-    base_fig_dir = "/Users/tejjolly/Documents/BioSimm/Meetings/2025-11-20--research_update/figures"
     subdir = "normalized" if NORMALIZED_TAG else "non-normalized"
-    out_dir = os.path.join(base_fig_dir, subdir)
+    out_dir = output_dir_for_phase3_geom_dye(
+        RUN_GEOMETRIES[0],
+        DYES[0],
+        PHASE3_SUBDIR,
+        subdir,
+    )
     os.makedirs(out_dir, exist_ok=True)
 
     if NORMALIZED_TAG:
@@ -1207,7 +1189,9 @@ def phase3_calc_tafe_and_plot_hmr():
             ax_s.set_title(title)
         ax_s.set_ylim([-0.40,0])
         plt.tight_layout()
-        fname = os.path.join(out_dir, f"TAGvHMR_{build_case_name(geom, '', dye)}.svg")
+        series_out_dir = output_dir_for_phase3_geom_dye(geom, dye, PHASE3_SUBDIR, subdir)
+        os.makedirs(series_out_dir, exist_ok=True)
+        fname = os.path.join(series_out_dir, f"TAGvHMR{('_d' + dye) if dye else ''}.svg")
         plt.savefig(fname, format="svg", transparent=True, dpi=600)
         plt.show()
 

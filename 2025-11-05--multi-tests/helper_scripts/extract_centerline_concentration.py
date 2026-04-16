@@ -1,13 +1,21 @@
 # export_centerline_conc_batch_verbose.py
 import argparse
-import csv
 import json
 import os
 import sys
 from glob import glob
-from pathlib import Path
+
+from case_utils import build_case_name, concentration_csv_path, resolve_existing_path
+from timeseries_csv_utils import (
+    append_timeseries_csv,
+    merge_timeseries_csv,
+    missing_selected_rows_from_timeseries_csv,
+    relabel_saved_timeseries_csv,
+)
 
 PV_PYTHON = "/Applications/ParaView-5.13.1.app/Contents/bin/pvpython"
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+PROJECT_DIR = os.path.dirname(SCRIPT_DIR)
 
 
 def parse_cli_args():
@@ -46,7 +54,8 @@ def parse_cli_args():
         "--case-specs-json",
         type=str,
         default=None,
-        help="JSON list of case-spec dictionaries to process instead of the built-in CASE_SPECS.",
+        required=True,
+        help="JSON list of case-spec dictionaries to process.",
     )
     return parser.parse_known_args(sys.argv[1:])[0]
 
@@ -64,43 +73,11 @@ from paraview.simple import *
 ROOT_DIR = "/Volumes/biosimm-Tej-Jolly/2026-02-03--mass_balance"
 CENTERLINE_CANDIDATES = [
     os.path.join(ROOT_DIR, "centerline_LCA.vtp"),
-    (
-        "/Users/tejjolly/Documents/BioSimm/Simulations/Post_Processing/"
-        "2025-11-05--multi-tests/centerlines/centerline_LCA.vtp"
-    ),
+    os.path.join(PROJECT_DIR, "centerlines", "centerline_LCA.vtp"),
 ]
-CONCENTRATION_DIR = (
-    "/Users/tejjolly/Documents/BioSimm/Simulations/"
-    "Post_Processing/2025-11-05--multi-tests/concentrations"
-)
-
-DEFAULT_CASE_SPECS = [
-    {
-        "geom": "80",
-        "run_suffix": "",
-        "dye": "",
-        "case_dir": "g80",
-        "child_folder": "96-procs",
-        # "step_override": 514,
-    },
-]
-
-# True -> save only one snapshot instead of the full time series
-SAVE_ONLY_TMAX = True
-
-# If set to an integer, use that result step directly instead of auto-picking
-# the max inlet-concentration step from B_HF_Concentration_average.txt.
-MANUAL_STEP = None
-
-# If set to a float, use the nearest available result time instead of auto-picking
-# the max inlet-concentration time from B_HF_Concentration_average.txt.
-MANUAL_TIME = None
 
 
 def load_case_specs():
-    if not CLI_ARGS.case_specs_json:
-        return DEFAULT_CASE_SPECS
-
     try:
         raw_specs = json.loads(CLI_ARGS.case_specs_json)
     except json.JSONDecodeError as exc:
@@ -125,6 +102,12 @@ def load_case_specs():
             spec["case_dir"] = str(raw_spec["case_dir"])
         if raw_spec.get("child_folder") is not None:
             spec["child_folder"] = str(raw_spec["child_folder"])
+        if raw_spec.get("results_dir") is not None:
+            spec["results_dir"] = str(raw_spec["results_dir"])
+        if raw_spec.get("tag_dir") is not None:
+            spec["tag_dir"] = str(raw_spec["tag_dir"])
+        if raw_spec.get("concentration_dir") is not None:
+            spec["concentration_dir"] = str(raw_spec["concentration_dir"])
         if raw_spec.get("step_override") is not None:
             spec["step_override"] = int(raw_spec["step_override"])
         if raw_spec.get("time_override") is not None:
@@ -137,32 +120,6 @@ def load_case_specs():
 
 
 CASE_SPECS = load_case_specs()
-
-
-def resolve_existing_path(paths):
-    for path in paths:
-        if os.path.exists(path):
-            return path
-    raise FileNotFoundError(f"Could not find any of: {paths}")
-
-
-def build_case_base(geom, run_suffix=""):
-    case = f"g{geom}"
-    if run_suffix:
-        case += f"_r{run_suffix}"
-    return case
-
-
-def build_case_name(geom, run_suffix="", dye=""):
-    case = build_case_base(geom, run_suffix)
-    if dye:
-        case += f"_d{dye}"
-    return case
-
-
-def build_output_csv_path(case_name, save_only_tmax):
-    suffix = "_concentration.csv" if save_only_tmax else "_concentration_timeseries.csv"
-    return os.path.join(CONCENTRATION_DIR, f"{case_name}{suffix}")
 
 
 def load_avgfile_rows(path):
@@ -282,221 +239,94 @@ def resolve_vtu_path(results_dir, step_idx):
     return None
 
 
-def relabel_saved_timeseries_csv(csv_path, selected_rows):
-    if not selected_rows or not os.path.exists(csv_path):
-        return
+def delete_paraview_proxy(proxy):
+    try:
+        Delete(proxy)
+    except Exception:
+        pass
 
-    with open(csv_path, "r", newline="") as f:
-        reader = csv.DictReader(f)
-        fieldnames = list(reader.fieldnames or [])
-        rows = list(reader)
 
-    if not rows:
-        return
-
-    frame_col = None
-    for candidate in ["TimeStep", "Time Step", "time_step", "Time", "time"]:
-        if candidate in fieldnames:
-            frame_col = candidate
-            break
-    if frame_col is None:
-        print(f"[WARN] Could not find a frame column in {csv_path}; leaving saved times unchanged")
-        return
-
-    saved_frame_ids = []
-    seen_ids = set()
-    for row in rows:
-        frame_id = row.get(frame_col, "")
-        if frame_id not in seen_ids:
-            seen_ids.add(frame_id)
-            saved_frame_ids.append(frame_id)
-
-    if len(saved_frame_ids) != len(selected_rows):
-        print(
-            f"[WARN] Saved frame count ({len(saved_frame_ids)}) does not match selected step count "
-            f"({len(selected_rows)}) in {csv_path}; leaving saved times unchanged"
-        )
-        return
-
-    step_map = {
-        saved_id: int(row["step"])
-        for saved_id, row in zip(saved_frame_ids, selected_rows)
-    }
-    time_map = {
-        saved_id: float(row["time"])
-        for saved_id, row in zip(saved_frame_ids, selected_rows)
-    }
-
-    timestep_col = next(
-        (candidate for candidate in ["TimeStep", "Time Step", "time_step"] if candidate in fieldnames),
-        "TimeStep",
+def save_resampled_timeseries_csv(csv_path, volume):
+    resampled = ResampleWithDataset(
+        SourceDataArrays=volume,
+        DestinationMesh=centerline,
     )
-    time_col = next(
-        (candidate for candidate in ["Time", "time"] if candidate in fieldnames),
-        "Time",
+    resampled.UpdatePipeline()
+
+    SaveData(
+        csv_path,
+        proxy=resampled,
+        WriteTimeSteps=1,
+        ChooseArraysToWrite=1,
+        AddTime=1,
+        AddTimeStep=1,
+        AddMetaData=1,
+        PointDataArrays=[
+            "Concentration",
+            "Pressure",
+            "Velocity",
+        ],
     )
-
-    if timestep_col not in fieldnames:
-        fieldnames.insert(0, timestep_col)
-    if time_col not in fieldnames:
-        insert_at = 1 if timestep_col in fieldnames else 0
-        fieldnames.insert(insert_at, time_col)
-
-    for row in rows:
-        frame_id = row.get(frame_col, "")
-        row[timestep_col] = step_map[frame_id]
-        row[time_col] = f"{time_map[frame_id]:.12g}"
-
-    with open(csv_path, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        writer.writeheader()
-        writer.writerows(rows)
-
-    print(f"[INFO] Relabeled saved times in {csv_path} using physical times from the average file")
+    delete_paraview_proxy(resampled)
 
 
-def load_saved_timeseries_metadata(csv_path):
-    if not os.path.exists(csv_path):
-        return [], []
-
-    with open(csv_path, "r", newline="") as f:
-        reader = csv.DictReader(f)
-        fieldnames = list(reader.fieldnames or [])
-        rows = list(reader)
-
-    if not rows:
-        return [], []
-
-    timestep_col = next(
-        (candidate for candidate in ["TimeStep", "Time Step", "time_step"] if candidate in fieldnames),
-        None,
-    )
-    time_col = next(
-        (candidate for candidate in ["Time", "time"] if candidate in fieldnames),
-        None,
-    )
-
-    saved_steps = []
-    saved_times = []
-    seen_frames = set()
-    frame_key_col = timestep_col or time_col
-    if frame_key_col is None:
-        return [], []
-
-    for row in rows:
-        frame_key = row.get(frame_key_col, "")
-        if frame_key in seen_frames:
-            continue
-        seen_frames.add(frame_key)
-
-        if timestep_col is not None:
-            try:
-                saved_steps.append(int(float(row[timestep_col])))
-            except Exception:
-                saved_steps.append(None)
-        if time_col is not None:
-            try:
-                saved_times.append(float(row[time_col]))
-            except Exception:
-                saved_times.append(None)
-
-    return saved_steps, saved_times
+def iter_chunks(items, chunk_size):
+    for start in range(0, len(items), chunk_size):
+        yield start, items[start:start + chunk_size]
 
 
-def infer_timeseries_frame_columns(fieldnames):
-    timestep_col = next(
-        (candidate for candidate in ["TimeStep", "Time Step", "time_step"] if candidate in fieldnames),
-        None,
-    )
-    time_col = next(
-        (candidate for candidate in ["Time", "time"] if candidate in fieldnames),
-        None,
-    )
-    return timestep_col, time_col
+def make_unique_sidecar_path(path, suffix):
+    candidate = f"{path}{suffix}"
+    counter = 1
+    while os.path.exists(candidate):
+        candidate = f"{path}{suffix}.{counter:03d}"
+        counter += 1
+    return candidate
 
 
-def missing_selected_rows_from_timeseries_csv(csv_path, selected_rows, atol=1e-9):
-    if not selected_rows:
-        return []
+def save_selected_timesteps_with_progress(work_items, save_target_csv, chunk_size=100):
+    total = len(work_items)
 
-    saved_steps, saved_times = load_saved_timeseries_metadata(csv_path)
-    if saved_steps and all(step is not None for step in saved_steps):
-        saved_step_set = set(saved_steps)
-        return [row for row in selected_rows if int(row["step"]) not in saved_step_set]
+    chunk_count = (total + chunk_size - 1) // chunk_size
+    for chunk_idx, (start_idx, chunk) in enumerate(iter_chunks(work_items, chunk_size), start=1):
+        rows = [row for row, _ in chunk]
+        vtu_paths = [vtu_path for _, vtu_path in chunk]
+        first_row = rows[0]
+        last_row = rows[-1]
+        first_step = int(first_row["step"])
+        last_step = int(last_row["step"])
+        first_time = float(first_row["time"])
+        last_time = float(last_row["time"])
 
-    if saved_times and all(time is not None for time in saved_times):
-        missing_rows = []
-        for row in selected_rows:
-            target_time = float(row["time"])
-            if not any(abs(saved_time - target_time) <= atol for saved_time in saved_times):
-                missing_rows.append(row)
-        return missing_rows
-
-    return list(selected_rows)
-
-
-def load_timeseries_csv_rows(csv_path):
-    with open(csv_path, "r", newline="") as f:
-        reader = csv.DictReader(f)
-        fieldnames = list(reader.fieldnames or [])
-        rows = list(reader)
-    return fieldnames, rows
-
-
-def frame_sort_key(frame_key):
-    kind, value = frame_key
-    return (0, value) if kind == "step" else (1, value)
-
-
-def group_rows_by_frame(rows, timestep_col, time_col):
-    groups = {}
-    for row in rows:
-        if timestep_col is not None and row.get(timestep_col, "") != "":
-            frame_key = ("step", int(float(row[timestep_col])))
-        elif time_col is not None and row.get(time_col, "") != "":
-            frame_key = ("time", float(row[time_col]))
+        if save_target_csv.endswith(".csv"):
+            part_csv = save_target_csv[:-4] + f"_part_{chunk_idx:04d}.csv"
         else:
-            frame_key = ("row", len(groups))
-        groups.setdefault(frame_key, []).append(row)
-    return groups
+            part_csv = f"{save_target_csv}_part_{chunk_idx:04d}.csv"
 
+        if os.path.exists(part_csv):
+            os.remove(part_csv)
 
-def merge_timeseries_csv(existing_csv_path, new_csv_path):
-    if not os.path.exists(existing_csv_path):
-        os.replace(new_csv_path, existing_csv_path)
-        return
-    if not os.path.exists(new_csv_path):
-        return
+        print(
+            f"[PROGRESS] Saving chunk {chunk_idx}/{chunk_count} "
+            f"(timesteps {start_idx + 1}-{start_idx + len(chunk)}/{total}): "
+            f"steps={first_step}-{last_step}, times={first_time:.12g}-{last_time:.12g}",
+            flush=True,
+        )
 
-    existing_fieldnames, existing_rows = load_timeseries_csv_rows(existing_csv_path)
-    new_fieldnames, new_rows = load_timeseries_csv_rows(new_csv_path)
+        volume = OpenDataFile(vtu_paths)
+        save_resampled_timeseries_csv(part_csv, volume)
+        delete_paraview_proxy(volume)
 
-    fieldnames = list(existing_fieldnames)
-    for field in new_fieldnames:
-        if field not in fieldnames:
-            fieldnames.append(field)
+        relabel_saved_timeseries_csv(part_csv, rows)
+        append_timeseries_csv(save_target_csv, part_csv)
+        if os.path.exists(part_csv):
+            os.remove(part_csv)
 
-    timestep_col, time_col = infer_timeseries_frame_columns(fieldnames)
-    merged_groups = group_rows_by_frame(existing_rows, timestep_col, time_col)
-    new_groups = group_rows_by_frame(new_rows, timestep_col, time_col)
-
-    for frame_key, rows in new_groups.items():
-        merged_groups[frame_key] = rows
-
-    merged_frame_keys = sorted(merged_groups.keys(), key=frame_sort_key)
-    merged_rows = []
-    for frame_key in merged_frame_keys:
-        merged_rows.extend(merged_groups[frame_key])
-
-    with open(existing_csv_path, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        writer.writeheader()
-        writer.writerows(merged_rows)
+    print(f"[INFO] Finished saving {total}/{total} timestep(s) to {save_target_csv}", flush=True)
 
 
 centerline_path = resolve_existing_path(CENTERLINE_CANDIDATES)
 centerline = OpenDataFile(centerline_path)
-os.makedirs(CONCENTRATION_DIR, exist_ok=True)
 
 for spec in CASE_SPECS:
     geom = spec["geom"]
@@ -505,8 +335,15 @@ for spec in CASE_SPECS:
     child_folder = spec.get("child_folder", "96-procs")
 
     case_name = build_case_name(geom, run_suffix, dye)
-    case_dir = os.path.join(ROOT_DIR, spec.get("case_dir", case_name))
-    results_dir = os.path.join(case_dir, child_folder)
+    case_dir = spec.get("case_dir", case_name)
+    if not os.path.isabs(case_dir):
+        case_dir = os.path.join(ROOT_DIR, case_dir)
+    results_dir = spec.get("results_dir", os.path.join(case_dir, child_folder))
+    concentration_dir = spec.get(
+        "concentration_dir",
+        os.path.join(case_dir, "TAG", "concentrations"),
+    )
+    os.makedirs(concentration_dir, exist_ok=True)
 
     print(f"[INFO] Processing {case_name} from {results_dir} ...")
 
@@ -515,8 +352,14 @@ for spec in CASE_SPECS:
         print(f"[WARN] No result_*.vtu in {results_dir}, skipping")
         continue
 
-    save_only_tmax = SAVE_ONLY_TMAX and not CLI_ARGS.save_all_timesteps
-    out_csv = build_output_csv_path(case_name, save_only_tmax)
+    save_only_tmax = not CLI_ARGS.save_all_timesteps
+    out_csv = concentration_csv_path(
+        concentration_dir,
+        geom,
+        run_suffix,
+        dye,
+        full_series=not save_only_tmax,
+    )
     time_range = tuple(CLI_ARGS.time_range) if CLI_ARGS.time_range is not None else None
     selected_rows_for_range = None
     missing_rows_for_range = None
@@ -551,11 +394,11 @@ for spec in CASE_SPECS:
     if save_only_tmax:
         step_override = spec.get("step_override")
         if step_override is None:
-            step_override = CLI_ARGS.manual_step if CLI_ARGS.manual_step is not None else MANUAL_STEP
+            step_override = CLI_ARGS.manual_step
 
         time_override = spec.get("time_override")
         if time_override is None:
-            time_override = CLI_ARGS.manual_time if CLI_ARGS.manual_time is not None else MANUAL_TIME
+            time_override = CLI_ARGS.manual_time
 
         if step_override is not None:
             step_idx = int(step_override)
@@ -613,6 +456,7 @@ for spec in CASE_SPECS:
     else:
         selected_vtu_files = vtu_files
         selected_rows = None
+        selected_work_items = None
         save_target_csv = out_csv
         merge_after_save = False
         if time_range is not None:
@@ -625,14 +469,41 @@ for spec in CASE_SPECS:
                 else:
                     save_target_csv = f"{out_csv}_missing.csv"
                 merge_after_save = True
+                if os.path.exists(save_target_csv):
+                    remaining_rows = missing_selected_rows_from_timeseries_csv(save_target_csv, selected_rows)
+                    recovered_count = len(selected_rows) - len(remaining_rows)
+                    if recovered_count > 0:
+                        print(
+                            f"[INFO] Resuming from existing partial CSV: recovered "
+                            f"{recovered_count} timestep(s) from {save_target_csv}"
+                        )
+                        selected_rows = remaining_rows
+                    else:
+                        archive_path = make_unique_sidecar_path(save_target_csv, ".unusable")
+                        os.replace(save_target_csv, archive_path)
+                        print(
+                            f"[WARN] Existing partial CSV had no reusable timestep metadata; "
+                            f"moved it to {archive_path}"
+                        )
+
+                    if not selected_rows:
+                        print(
+                            f"[INFO] Existing partial CSV already contains all missing timestep(s); "
+                            f"merging into {out_csv}"
+                        )
+                        merge_timeseries_csv(out_csv, save_target_csv)
+                        os.remove(save_target_csv)
+                        continue
 
             selected_vtu_files = []
+            selected_work_items = []
             for row in selected_rows:
                 vtu_path = resolve_vtu_path(results_dir, int(row["step"]))
                 if vtu_path is None:
                     print(f"[WARN] Could not find VTU for step {row['step']} in {results_dir}")
                     continue
                 selected_vtu_files.append(vtu_path)
+                selected_work_items.append((row, vtu_path))
 
             if not selected_vtu_files:
                 print(f"[WARN] No VTU files resolved in time range {time_range} for {case_name}, skipping")
@@ -645,37 +516,21 @@ for spec in CASE_SPECS:
         else:
             print(f"  [INFO] Loading full time series for {case_name}")
 
-        volume = OpenDataFile(selected_vtu_files)
-
-        anim = GetAnimationScene()
-        anim.UpdateAnimationUsingDataTimeSteps()
-
-        resampled = ResampleWithDataset(
-            SourceDataArrays=volume,
-            DestinationMesh=centerline,
-        )
-        resampled.UpdatePipeline()
-
-        print(f"[INFO] Saving ALL timesteps to {save_target_csv}")
-        SaveData(
-            save_target_csv,
-            proxy=resampled,
-            WriteTimeSteps=1,
-            ChooseArraysToWrite=1,
-            AddTime=1,
-            AddTimeStep=1,
-            AddMetaData=1,
-            PointDataArrays=[
-                "Concentration",
-                "Pressure",
-                "Velocity",
-            ],
-        )
-        if selected_rows is not None:
-            relabel_saved_timeseries_csv(save_target_csv, selected_rows)
+        if selected_work_items is not None:
+            print(f"[INFO] Saving selected timesteps to {save_target_csv}")
+            save_selected_timesteps_with_progress(selected_work_items, save_target_csv)
             if merge_after_save:
                 merge_timeseries_csv(out_csv, save_target_csv)
                 os.remove(save_target_csv)
+        else:
+            volume = OpenDataFile(selected_vtu_files)
+
+            anim = GetAnimationScene()
+            anim.UpdateAnimationUsingDataTimeSteps()
+
+            print(f"[INFO] Saving ALL timesteps to {save_target_csv}")
+            save_resampled_timeseries_csv(save_target_csv, volume)
+            delete_paraview_proxy(volume)
 
     print(f"[OK] {case_name} done")
 
