@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
+import json
 import os
+import re
+import shutil
 import subprocess
 import pandas as pd
 import numpy as np
@@ -9,15 +12,28 @@ from matplotlib.lines import Line2D
 # ============================================================
 # TOGGLES — change here in the IDE
 # ============================================================
+BASE = "/Volumes/biosimm-Tej-Jolly/2026-02-03--mass_balance"
 RUN_PHASES = [1, 2]          # e.g. [1,2,3] or [2,3] or [3]
-RUN_GEOMETRIES = ["80"]      # order matters
+RUN_GEOMETRIES = ["87"]      # order matters
 PLOT_VELOCITY = False         # show velocity + secondary y in phase 2
 THRESHOLD = 0            # slope: from max conc down to <= this
 FIT_GEOMETRY = False          # fit HMR vs TAG per geometry in phase 3
-NORMALIZE_CONC = False        # normalize phase-2 curves by their own max
+NORMALIZE_CONC = True        # normalize phase-2 curves by their own max
 NORMALIZED_TAG = False
-PHASE1_MANUAL_TIME = 5.6    # set a physical time to override the auto t_max lookup in phase 1
+PHASE1_MANUAL_TIME = None    # set a physical time to override the auto t_max lookup in phase 1
 REVERSE_CENTERLINE_DIRECTION = True  # if True, treat the end of the current arc/profile as the physical inlet
+PHASE2_ANIMATION_TIME_RANGE = (5.16, 26.66)  # set to (t_start, t_end) to save one frame per available time in that range
+PHASE2_ANIMATION_OUTPUT_DIR = (
+    "/Users/tejjolly/Documents/BioSimm/Simulations/Post_Processing/"
+    "2025-11-05--multi-tests/images/animation"
+)
+PHASE2_MANUAL_SNAPSHOT_DIR = (
+    "/Users/tejjolly/Documents/BioSimm/Simulations/Post_Processing/"
+    "2025-11-05--multi-tests/images"
+)
+PHASE2_ANIMATION_DPI = 300
+PHASE2_OUTPUT_FORMATS = ("png", "svg")
+OVERWRITE_EXISTING = False  # if False, skip CSVs/frames that already exist; if True, regenerate them
 
 PHASE2_FONTSIZE = 16         # controls only Phase-2 figure text
 
@@ -26,9 +42,9 @@ FIGSIZE_PHASE2 = (8, 5)      # for phase-2 concentration plots (original 8x5)
 FIGSIZE_PHASE3 = (8, 5)      # for TAG vs HMR plots (combined + individual) (original 6x4)
 
 PHASE2_CLEAN = False   # removes all axis text/labels/ticks/legend/title
-PHASE2_LEGEND = True
-PLOT_TITLES = True
-PHASE2_BUPU_RANGE = (1, 1.0)  # min/max fraction of the BuPu colormap used in phase 2
+PHASE2_LEGEND = False
+PLOT_TITLES = False
+PHASE2_BUPU_RANGE = (0.9, 1.0)  # min/max fraction of the BuPu colormap used in phase 2
 
 # dyes / AIFs
 DYES = [""]                  # empty string means no dye label in the case name
@@ -53,8 +69,6 @@ PHASE2_FONTSIZE = 16         # controls only Phase-2 figure text
 # ------------------------------------------------------------
 # PATHS / CONFIG
 # ------------------------------------------------------------
-BASE = "/Volumes/biosimm-Tej-Jolly/2026-02-03--mass_balance"
-
 PV_PYTHON = "/Applications/ParaView-5.13.1.app/Contents/bin/pvpython"
 EXTRACT_SCRIPT = (
     "/Users/tejjolly/Documents/BioSimm/Simulations/Post_Processing/"
@@ -63,14 +77,19 @@ EXTRACT_SCRIPT = (
 
 HMR_CSV = os.path.join(BASE, "hmr_data.csv")
 
-# run suffixes per geometry (your latest)
+# extractor defaults; override per case below if needed
+DEFAULT_CHILD_FOLDER = "96-procs"
+CASE_DIR_OVERRIDES = {}
+CHILD_FOLDER_OVERRIDES = {}
+
+# run suffixes per geometry (supports values like "24", "24_v3", "62_fast")
 RUN_SUFFIXES = {
-    "80": [""],
+    "87": ["24"],
 }
 
 # arc-length file per geometry
 ARC_PATHS = {
-    "80": [
+    "87": [
         os.path.join(BASE, "centerline_LCA.csv"),
         (
             "/Users/tejjolly/Documents/BioSimm/Simulations/Post_Processing/"
@@ -97,8 +116,10 @@ def make_cmap_levels(level_range, count: int):
 def suffix_to_rmicro(sfx: str) -> float:
     if not sfx:
         return np.nan
-    base = sfx.split("_")[0]   # '81_v2' -> '81'
-    return float(base) / 100.0
+    match = re.match(r"([+-]?(?:\d+(?:\.\d*)?|\.\d+))", sfx)
+    if match is None:
+        return np.nan
+    return float(match.group(1)) / 100.0
 
 
 def build_case_base(geom: str, suffix: str = "") -> str:
@@ -120,6 +141,37 @@ def build_plot_stem(prefix: str, geom: str, dye: str = "") -> str:
     if dye:
         stem += f"_d{dye}"
     return stem
+
+
+def build_extract_case_specs():
+    case_specs = []
+
+    for geom in RUN_GEOMETRIES:
+        suffixes = RUN_SUFFIXES.get(geom)
+        if suffixes is None:
+            raise KeyError(f"No RUN_SUFFIXES configured for geometry {geom}")
+
+        for suffix in suffixes:
+            for dye in DYES:
+                case_name = build_case_name(geom, suffix, dye)
+                case_base = build_case_base(geom, suffix)
+                case_dir = CASE_DIR_OVERRIDES.get(
+                    case_name,
+                    CASE_DIR_OVERRIDES.get(case_base, case_name),
+                )
+                child_folder = CHILD_FOLDER_OVERRIDES.get(
+                    case_name,
+                    CHILD_FOLDER_OVERRIDES.get(case_base, DEFAULT_CHILD_FOLDER),
+                )
+                case_specs.append({
+                    "geom": geom,
+                    "run_suffix": suffix,
+                    "dye": dye,
+                    "case_dir": case_dir,
+                    "child_folder": child_folder,
+                })
+
+    return case_specs
 
 
 def resolve_existing_path(path_config):
@@ -218,15 +270,33 @@ def make_geom_cmap(geom_index: int):
 
 def phase1_extract():
     print("[PHASE 1] running pvpython extractor …")
-    cmd = [PV_PYTHON, EXTRACT_SCRIPT]
-    if PHASE1_MANUAL_TIME is not None:
+    case_specs = build_extract_case_specs()
+    print(f"[PHASE 1] prepared {len(case_specs)} case spec(s) from post-process config")
+
+    cmd = [
+        PV_PYTHON,
+        EXTRACT_SCRIPT,
+        "--case-specs-json",
+        json.dumps(case_specs, separators=(",", ":")),
+    ]
+    if OVERWRITE_EXISTING:
+        cmd.append("--overwrite")
+    if phase2_animation_enabled():
+        cmd.append("--save-all-timesteps")
+        t_start, t_end = _phase2_animation_time_bounds()
+        cmd.extend(["--time-range", str(t_start), str(t_end)])
+        print(
+            "[PHASE 1] animation mode active; exporting time-series concentration CSVs "
+            f"for range [{t_start}, {t_end}]"
+        )
+    elif PHASE1_MANUAL_TIME is not None:
         cmd.extend(["--manual-time", str(PHASE1_MANUAL_TIME)])
         print(f"[PHASE 1] overriding auto t_max with manual time {PHASE1_MANUAL_TIME}")
     subprocess.run(cmd, check=True)
     print("[PHASE 1] done.")
 
 
-def _conc_csv_path(geom: str, suffix: str, dye: str) -> str:
+def _conc_csv_path(geom: str, suffix: str, dye: str, full_series: bool = False) -> str:
     """
     Build path like:
     BASE/concentrations/g13_r43_dB_concentration.csv
@@ -234,8 +304,340 @@ def _conc_csv_path(geom: str, suffix: str, dye: str) -> str:
     BASE/concentrations/g80_concentration.csv
     """
     case_name = build_case_name(geom, suffix, dye)
-    fname = f"{case_name}_concentration.csv"
+    if full_series:
+        fname = f"{case_name}_concentration_timeseries.csv"
+    else:
+        fname = f"{case_name}_concentration.csv"
     return os.path.join(CONC_DIR, fname)
+
+
+def phase2_animation_enabled() -> bool:
+    return PHASE2_ANIMATION_TIME_RANGE is not None
+
+
+def _phase2_animation_time_bounds():
+    if not phase2_animation_enabled():
+        return None, None
+    t0, t1 = PHASE2_ANIMATION_TIME_RANGE
+    return (t0, t1) if t0 <= t1 else (t1, t0)
+
+
+def phase2_manual_snapshot_enabled() -> bool:
+    return (not phase2_animation_enabled()) and (PHASE1_MANUAL_TIME is not None)
+
+
+def first_existing_column(columns, candidates):
+    return next((col for col in candidates if col in columns), None)
+
+
+def load_time_series_profiles(geom: str, suffix: str, dye: str, arc_all):
+    case_dye = build_case_name(geom, suffix, dye)
+    csv_path = _conc_csv_path(geom, suffix, dye, full_series=True)
+    if not os.path.exists(csv_path):
+        print(f"  [WARN] {csv_path} not found, skipping {case_dye}")
+        return []
+
+    df = pd.read_csv(csv_path)
+    if "Concentration" not in df.columns:
+        print(f"  [WARN] no 'Concentration' column in {csv_path}, skipping")
+        return []
+    time_col = first_existing_column(df.columns, ["Time", "time"])
+    if time_col is None:
+        print(f"  [WARN] no 'Time' column in {csv_path}; rerun phase 1 in animation mode")
+        return []
+
+    n_arc = len(arc_all)
+    timestep_col = first_existing_column(df.columns, ["TimeStep", "Time Step", "time_step"])
+    group_col = timestep_col if timestep_col is not None else time_col
+    frame_ids = df[group_col].drop_duplicates().tolist()
+
+    frames = []
+    for frame_id in frame_ids:
+        frame_raw = df.loc[df[group_col] == frame_id].reset_index(drop=True)
+        if frame_raw.empty:
+            continue
+
+        prof = load_centerline_profile(frame_raw, n_arc)
+        conc = prof["Concentration"].to_numpy()
+        if conc.size == 0:
+            continue
+
+        x_arc = arc_all[:len(conc)]
+        time_value = float(frame_raw[time_col].iloc[0])
+        if timestep_col is not None:
+            frame_key = int(frame_raw[timestep_col].iloc[0])
+        else:
+            frame_key = len(frames)
+
+        frames.append({
+            "frame_key": frame_key,
+            "time": time_value,
+            "x_arc": x_arc,
+            "conc": conc,
+            "prof": prof,
+        })
+
+    return frames
+
+
+def select_time_range_frames(frames):
+    t_start, t_end = _phase2_animation_time_bounds()
+    if t_start is None:
+        return frames
+    selected = [frame for frame in frames if t_start <= frame["time"] <= t_end]
+    return selected
+
+
+def format_time_token(time_value: float) -> str:
+    return f"{time_value:010.4f}".replace("-", "m").replace(".", "p")
+
+
+def build_output_paths(directory: str, stem: str, formats):
+    return [os.path.join(directory, f"{stem}.{fmt}") for fmt in formats]
+
+
+def outputs_exist(paths) -> bool:
+    return all(os.path.exists(path) for path in paths)
+
+
+def save_figure_in_formats(fig, directory: str, stem: str, formats, dpi: int, transparent: bool = True):
+    for fmt in formats:
+        out_path = os.path.join(directory, f"{stem}.{fmt}")
+        fig.savefig(out_path, format=fmt, dpi=dpi, transparent=transparent)
+
+
+def apply_phase2_clean_mode(ax1, ax2):
+    ax1.set_xticks([])
+    ax1.set_yticks([])
+    ax1.tick_params(axis="both", which="both", length=0, labelbottom=False, labelleft=False)
+
+    if ax2 is not None:
+        ax2.set_xticks([])
+        ax2.set_yticks([])
+        ax2.tick_params(axis="both", which="both", length=0, labelbottom=False, labelleft=False)
+
+    ax1.set_xlabel(None)
+    ax1.set_ylabel(None)
+    if ax2 is not None:
+        ax2.set_ylabel(None)
+
+    ax1.set_title("")
+
+    leg = ax1.get_legend()
+    if leg is not None:
+        leg.remove()
+
+    for spine in ["bottom", "left"]:
+        ax1.spines[spine].set_visible(True)
+
+    for spine in ["top", "right"]:
+        ax1.spines[spine].set_visible(True)
+
+    if ax2 is not None:
+        for spine in ["top", "right", "bottom", "left"]:
+            if spine in ax2.spines:
+                ax2.spines[spine].set_visible(False)
+
+
+def archive_existing_animation_frames():
+    archive_dir = os.path.join(PHASE2_ANIMATION_OUTPUT_DIR, "_ss")
+    os.makedirs(archive_dir, exist_ok=True)
+
+    moved_count = 0
+    for name in os.listdir(PHASE2_ANIMATION_OUTPUT_DIR):
+        src_path = os.path.join(PHASE2_ANIMATION_OUTPUT_DIR, name)
+        if name == "_ss" or not os.path.isfile(src_path):
+            continue
+
+        dst_path = os.path.join(archive_dir, name)
+        if os.path.exists(dst_path):
+            stem, ext = os.path.splitext(name)
+            counter = 1
+            while True:
+                candidate = os.path.join(archive_dir, f"{stem}_{counter:03d}{ext}")
+                if not os.path.exists(candidate):
+                    dst_path = candidate
+                    break
+                counter += 1
+
+        shutil.move(src_path, dst_path)
+        moved_count += 1
+
+    if moved_count > 0:
+        print(f"[PHASE 2] archived {moved_count} existing frame(s) to {archive_dir}")
+
+
+def phase2_save_animation_frames():
+    print("[PHASE 2] saving animation frames")
+    os.makedirs(PHASE2_ANIMATION_OUTPUT_DIR, exist_ok=True)
+    if OVERWRITE_EXISTING:
+        archive_existing_animation_frames()
+    t_start, t_end = _phase2_animation_time_bounds()
+    print(f"[PHASE 2] time range = [{t_start}, {t_end}]")
+
+    for geom in RUN_GEOMETRIES:
+        print(f"[PHASE 2] geometry g{geom}")
+        arc_all = load_arc_values(ARC_PATHS[geom])
+        suffixes = RUN_SUFFIXES[geom]
+        ordered = sort_suffixes(suffixes)
+
+        cmap = plt.get_cmap("BuPu")
+        c_levels = make_cmap_levels(PHASE2_BUPU_RANGE, len(ordered))
+        suffix_to_color = {
+            sfx: cmap(level)
+            for sfx, level in zip(ordered, c_levels)
+        }
+
+        for dye in DYES:
+            print(f"[PHASE 2]  dye {dye}")
+            series_frames = {}
+            group_max = 0.0
+            velocity_max = 0.0
+            frame_catalog = {}
+
+            for suffix in suffixes:
+                case_base = build_case_base(geom, suffix)
+                case_dye = build_case_name(geom, suffix, dye)
+                frames = load_time_series_profiles(geom, suffix, dye, arc_all)
+                frames = select_time_range_frames(frames)
+                if not frames:
+                    print(f"  [WARN] no frames found in range for {case_dye}")
+                    continue
+
+                frame_map = {}
+                for frame in frames:
+                    frame_map[frame["frame_key"]] = frame
+                    frame_catalog[frame["frame_key"]] = frame["time"]
+
+                    conc_max = float(np.nanmax(frame["conc"]))
+                    if conc_max > group_max:
+                        group_max = conc_max
+
+                    if PLOT_VELOCITY and all(
+                        col in frame["prof"].columns for col in ["Velocity:0", "Velocity:1", "Velocity:2"]
+                    ):
+                        vel_mag = np.sqrt(
+                            frame["prof"]["Velocity:0"] ** 2 +
+                            frame["prof"]["Velocity:1"] ** 2 +
+                            frame["prof"]["Velocity:2"] ** 2
+                        ).to_numpy()
+                        vel_frame_max = float(np.nanmax(vel_mag))
+                        if vel_frame_max > velocity_max:
+                            velocity_max = vel_frame_max
+
+                series_frames[suffix] = {
+                    "case_base": case_base,
+                    "case_dye": case_dye,
+                    "frames": frame_map,
+                }
+
+            if not series_frames:
+                print(f"  [WARN] no time-series data available for geometry g{geom}, dye {dye}")
+                continue
+
+            if group_max <= 0:
+                print(f"  [WARN] non-positive concentration max across selected range for g{geom}, dye {dye}")
+                continue
+
+            y_top = 1.0 if NORMALIZE_CONC else group_max * 1.02
+            frame_keys = sorted(frame_catalog, key=lambda key: frame_catalog[key])
+            print(f"  [INFO] saving {len(frame_keys)} frames to {PHASE2_ANIMATION_OUTPUT_DIR}")
+
+            with plt.rc_context({
+                "font.size": PHASE2_FONTSIZE,
+                "axes.labelsize": PHASE2_FONTSIZE,
+                "xtick.labelsize": PHASE2_FONTSIZE,
+                "ytick.labelsize": PHASE2_FONTSIZE,
+                "legend.fontsize": max(6, PHASE2_FONTSIZE - 2),
+            }):
+                for frame_index, frame_key in enumerate(frame_keys):
+                    frame_time = frame_catalog[frame_key]
+                    stem = build_plot_stem("tag", geom, dye)
+                    frame_stem = f"{stem}_frame_{frame_index:04d}_t{format_time_token(frame_time)}"
+                    out_paths = build_output_paths(
+                        PHASE2_ANIMATION_OUTPUT_DIR, frame_stem, PHASE2_OUTPUT_FORMATS
+                    )
+                    if outputs_exist(out_paths) and not OVERWRITE_EXISTING:
+                        print(f"  [SKIP] frame already exists: {frame_stem}")
+                        continue
+
+                    fig, ax1 = plt.subplots(figsize=FIGSIZE_PHASE2)
+                    ax2 = ax1.twinx() if PLOT_VELOCITY else None
+
+                    for suffix in suffixes:
+                        if suffix not in series_frames:
+                            continue
+                        frame = series_frames[suffix]["frames"].get(frame_key)
+                        if frame is None:
+                            continue
+
+                        color = suffix_to_color[suffix]
+                        conc = frame["conc"]
+                        prof = frame["prof"]
+                        x_arc = frame["x_arc"]
+                        if NORMALIZE_CONC and group_max > 0:
+                            conc_plot = conc / group_max
+                        else:
+                            conc_plot = conc
+
+                        ax1.plot(
+                            x_arc, conc_plot,
+                            label=series_frames[suffix]["case_base"],
+                            alpha=1.0,
+                            color=color,
+                            linewidth=3,
+                        )
+
+                        if PLOT_VELOCITY and ax2 is not None:
+                            if all(col in prof.columns for col in ["Velocity:0", "Velocity:1", "Velocity:2"]):
+                                vel_mag = np.sqrt(
+                                    prof["Velocity:0"] ** 2 +
+                                    prof["Velocity:1"] ** 2 +
+                                    prof["Velocity:2"] ** 2
+                                )
+                                ax2.plot(x_arc, vel_mag, linestyle=":", color=color, linewidth=2)
+
+                    ax1.set_xlabel("Centerline length [cm]")
+                    label_y = "Concentration" + (" (normalized to range max)" if NORMALIZE_CONC else "")
+                    ax1.set_ylabel(label_y)
+                    if PLOT_VELOCITY and ax2 is not None:
+                        ax2.set_ylabel("Velocity magnitude")
+                        if velocity_max > 0:
+                            ax2.set_ylim(0, velocity_max * 1.02)
+
+                    ax1.set_ylim(0, y_top)
+                    ax1.set_xlim(left=0)
+
+                    handles = [
+                        Line2D([0], [0], color=suffix_to_color[sfx], lw=3,
+                               label=format_suffix_label(geom, sfx))
+                        for sfx in ordered
+                        if sfx in series_frames
+                    ]
+                    if PHASE2_LEGEND and handles:
+                        ax1.legend(handles=handles, loc="best")
+
+                    geom_name = GEOM_LABELS.get(geom, f"g{geom}")
+                    dye_name = DYE_LABELS.get(dye, dye or "no dye label")
+                    if PLOT_TITLES:
+                        title = geom_name if not dye else f"{geom_name}, {dye_name}"
+                        ax1.set_title(f"{title}  t = {frame_time:.4f}")
+
+                    if PHASE2_CLEAN:
+                        apply_phase2_clean_mode(ax1, ax2)
+
+                    fig.tight_layout()
+                    save_figure_in_formats(
+                        fig,
+                        PHASE2_ANIMATION_OUTPUT_DIR,
+                        frame_stem,
+                        PHASE2_OUTPUT_FORMATS,
+                        dpi=PHASE2_ANIMATION_DPI,
+                        transparent=True,
+                    )
+                    plt.close(fig)
+
+    print("[PHASE 2] animation frames done.")
 
 
 def compute_tag_threshold_for_geom(geom: str, dye: str, threshold: float = 0.1):
@@ -401,6 +803,10 @@ def compute_tag_threshold_for_geom(geom: str, dye: str, threshold: float = 0.1):
     return rows
 
 def phase2_plot_concentration():
+    if phase2_animation_enabled():
+        phase2_save_animation_frames()
+        return
+
     print("[PHASE 2] plotting concentration (and maybe velocity)")
 
     for geom in RUN_GEOMETRIES:
@@ -531,7 +937,7 @@ def phase2_plot_concentration():
                             y_fit_plot = y_fit / group_max
                         else:
                             y_fit_plot = y_fit
-                        ax1.plot(x_seg, y_fit_plot, linestyle="--", color=color, linewidth=1.5)
+                        ax1.plot(x_seg, y_fit_plot, linestyle="--", color=color, linewidth=0.01)
                 ax1.set_xlabel("Centerline length [cm]")
                 label_y = "Concentration" + (" (normalized)" if NORMALIZE_CONC else "")
                 ax1.set_ylabel(label_y)
@@ -561,42 +967,7 @@ def phase2_plot_concentration():
                 # PHASE 2 CLEAN MODE (for inset usage)
                 # ------------------------------------------------------------
                 if PHASE2_CLEAN:
-                    # Turn off ticks AND tick labels
-                    ax1.set_xticks([])
-                    ax1.set_yticks([])
-                    ax1.tick_params(axis='both', which='both', length=0, labelbottom=False, labelleft=False)
-
-                    if ax2 is not None:
-                        ax2.set_xticks([])
-                        ax2.set_yticks([])
-                        ax2.tick_params(axis='both', which='both', length=0, labelbottom=False, labelleft=False)
-
-                    # Remove axis labels
-                    ax1.set_xlabel(None)
-                    ax1.set_ylabel(None)
-                    if ax2 is not None:
-                        ax2.set_ylabel(None)
-
-                    # Remove title
-                    ax1.set_title("")
-
-                    # Remove legend if present
-                    leg = ax1.get_legend()
-                    if leg is not None:
-                        leg.remove()
-
-                    # ---- Spines: keep ONLY bottom + left ----
-                    for spine in ["bottom", "left"]:
-                        ax1.spines[spine].set_visible(True)
-
-                    for spine in ["top", "right"]:
-                        ax1.spines[spine].set_visible(True)
-
-                    if ax2 is not None:
-                        # twin axis shares top + right spines → hide all of them
-                        for spine in ["top", "right", "bottom", "left"]:
-                            if spine in ax2.spines:
-                                ax2.spines[spine].set_visible(False)
+                    apply_phase2_clean_mode(ax1, ax2)
                 fig.tight_layout()
                 out_name = f"{build_plot_stem('tag', geom, dye)}.svg"
                 if NORMALIZE_CONC:
@@ -609,6 +980,23 @@ def phase2_plot_concentration():
                         f"/Users/tejjolly/Documents/BioSimm/Meetings/2025-11-20--research_update/figures/non-normalized/{out_name}",
                         format="svg", transparent=True, dpi=600
                     )
+                if phase2_manual_snapshot_enabled():
+                    os.makedirs(PHASE2_MANUAL_SNAPSHOT_DIR, exist_ok=True)
+                    manual_stem = (
+                        f"{build_plot_stem('tag', geom, dye)}_t{format_time_token(PHASE1_MANUAL_TIME)}"
+                    )
+                    manual_out_paths = build_output_paths(
+                        PHASE2_MANUAL_SNAPSHOT_DIR, manual_stem, PHASE2_OUTPUT_FORMATS
+                    )
+                    if OVERWRITE_EXISTING or not outputs_exist(manual_out_paths):
+                        save_figure_in_formats(
+                            fig,
+                            PHASE2_MANUAL_SNAPSHOT_DIR,
+                            manual_stem,
+                            PHASE2_OUTPUT_FORMATS,
+                            dpi=PHASE2_ANIMATION_DPI,
+                            transparent=True,
+                        )
                 plt.show()
 
     print("[PHASE 2] done.")
