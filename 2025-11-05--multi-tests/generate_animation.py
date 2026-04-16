@@ -15,11 +15,11 @@ from pathlib import Path
 # SETTINGS — EDIT THESE
 # ============================================================
 
-RESULTS_DIR = "/Volumes/biosimm-Tej-Jolly/2026-02-03--mass_balance/g87_r24/96-procs"
+RESULTS_DIR = "/Volumes/maxone/2026-02-03--mass_balance/g87_r43/96-procs"
 OUTPUT_FOLDER_NAME = "3d_dye_frames"
 
-START_INDEX = 430
-END_INDEX   = 2660
+START_INDEX = 172
+END_INDEX   = 2408
 
 ARRAY_NAME = "Concentration"
 COLOR_RANGE_MIN = 0.0

@@ -7,10 +7,11 @@ This version can exclude cells whose CENTERS fall outside a spatial mask
 (e.g. to remove the aorta and keep only coronaries).
 
 It also:
-- saves outputs to the local output folder
 - saves outputs to the case-level CIP_animation folder
 - snapshots any existing non-snapshot contents in that case-level CIP_animation folder
   into _ss-YYYYMMDD-HHMMSS before writing new outputs
+- can infer the middle of a full-threshold plateau instead of reading every VTU
+- writes a progress CSV during processing so interrupted runs can be resumed
 
 Edit the SETTINGS block below. No command-line parsing is used.
 """
@@ -27,14 +28,17 @@ from pathlib import Path
 # SETTINGS — EDIT THESE
 # ============================================================
 
-RESULTS_DIR = "/Volumes/biosimm-Tej-Jolly/2026-02-03--mass_balance/g87_r24/96-procs"
+RESULTS_DIR = "/Volumes/maxone/2026-02-03--mass_balance/g87_r43/96-procs"
+# RESULTS_DIR = "/Volumes/biosimm-Tej-Jolly/2026-02-03--mass_balance/g87_r24/96-procs"
 
 ARRAY_NAME = "Concentration"   # Name of the concentration array
 THRESHOLD = 5.0                # Count cells with concentration > THRESHOLD
 DT = 0.01                      # Seconds per result index, e.g. result_346 -> 3.46 s
 
-T_START = 4.3                 # Start time in seconds
-T_END = 26.66                # End time in seconds; use None for last available file
+T_START = 1.72                 # Start time in seconds
+T_END = 24.08                # End time in seconds; use None for last available file
+# T_START = 4.3                 # Start time in seconds
+# T_END = 26.6                # End time in seconds; use None for last available file
 
 NORMALIZE_Y = True             # If True, plot y-axis as 0 to 1
 STRICT_TIME_WINDOW = False     # If True, only include files with exact implied time in [T_START, T_END]
@@ -42,7 +46,6 @@ STRICT_TIME_WINDOW = False     # If True, only include files with exact implied 
 # Leave as None to auto-name outputs in the configured output directories
 OUT_PREFIX = None
 
-LOCAL_OUTPUT_DIR = "/Users/tejjolly/Documents/BioSimm/Simulations/Post_Processing/2025-11-05--multi-tests/images"
 SAVE_ANIMATION = True
 WRITE_DEBUG_MASK_VTU = True
 DEBUG_MASK_ONLY_FIRST_FILE = True
@@ -54,10 +57,21 @@ PVPYTHON_PATH = "/Applications/ParaView-5.13.1.app/Contents/bin/pvpython"
 # SPATIAL EXCLUSION SETTINGS
 # ------------------------------------------------------------
 
-USE_CACHE = False  # keep False initially so you do not reuse old non-excluded CSVs
+USE_CACHE = True  # Reuse matching completed/progress CSV rows when rerunning.
+WRITE_PROGRESS_CACHE = True
+PROGRESS_CACHE_SUFFIX = "-progress"
+# IMPORT_OK_LOG_PATH = "/Volumes/biosimm-Tej-Jolly/2026-02-03--mass_balance/g87_r24/cip_output_log.txt"
+IMPORT_OK_LOG_PATH = None
+
+# Optional: path to a text file containing old [OK] terminal output.
+# Useful only for salvaging an interrupted older run that did not write a CSV.
+INFER_FULL_THRESHOLD_PLATEAU = True
+# If True, once every included cell is above the threshold, process backward
+# from the final selected step until that full-coverage plateau is found again.
+# The unprocessed middle is filled as fraction=1.0 and count=total included cells.
 
 # Plane-based mask settings
-EXCLUDE_MODE = "multi_plane"   # allowed: "none", "plane", "multi_plane", "box"
+EXCLUDE_MODE = "multi_plane"   # allowed: "none", "plane", "multi_plane"
 PLANE_TOL = 1.0e-12
 
 PLANES = [
@@ -76,21 +90,6 @@ PLANES = [
 ]
 
 MULTI_PLANE_COMBINE_MODE = "union"   # allowed: "union", "intersection"
-
-# Rotated-box mask settings
-EXCLUDE_BOX = True
-
-# Box values you gave
-BOX_POSITION = (3.2026, -3.64914, -14.3248)
-BOX_ROTATION = (-26.8878, 20.271, 106.829)   # degrees
-BOX_LENGTH = (3.23458, 3.3829, 3.4215)
-
-# Rotation order for the box orientation. Start with "XYZ".
-# If the box looks misaligned, the first thing to try is changing this.
-BOX_ROTATION_ORDER = "XYZ"
-
-# Tiny tolerance for inside-box test
-BOX_TOL = 1.0e-12
 
 # ============================================================
 # END SETTINGS
@@ -126,6 +125,21 @@ import vtk
 from vtk.util.numpy_support import vtk_to_numpy
 
 RESULT_RE = re.compile(r"result_(\d+)\.vtu$")
+ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+CSV_HEADER = [
+    "time_s",
+    "file_index",
+    "fraction_above_threshold",
+    "normalized_fraction_above_threshold",
+    "cells_above_threshold",
+    "total_cells",
+    "excluded_cells",
+    "original_total_cells",
+    "threshold",
+    "array_name",
+    "data_origin",
+    "spatial_signature",
+]
 
 
 def find_result_files(results_dir: Path):
@@ -193,20 +207,23 @@ def get_results_output_root(results_dir: Path):
 
 def build_output_prefixes(results_dir: Path, out_prefix):
     stem = build_output_stem(results_dir, out_prefix)
+    return [get_results_output_root(results_dir) / stem]
 
-    prefixes = [
-        Path(LOCAL_OUTPUT_DIR) / stem,
-        get_results_output_root(results_dir) / stem,
-    ]
 
-    unique_prefixes = []
+def build_progress_cache_path(out_prefix: Path):
+    return out_prefix.parent / f"{out_prefix.name}{PROGRESS_CACHE_SUFFIX}.csv"
+
+
+def build_cache_csv_paths(output_prefixes):
+    paths = []
     seen = set()
-    for prefix in prefixes:
-        resolved = str(prefix)
-        if resolved not in seen:
-            seen.add(resolved)
-            unique_prefixes.append(prefix)
-    return unique_prefixes
+    for out_prefix in output_prefixes:
+        for path in [out_prefix.with_suffix(".csv"), build_progress_cache_path(out_prefix)]:
+            key = str(path)
+            if key not in seen:
+                seen.add(key)
+                paths.append(path)
+    return paths
 
 
 def tuple_to_string(x):
@@ -239,24 +256,18 @@ def build_spatial_signature():
                 f"{prefix}_keep_positive_side={plane['keep_positive_side']}",
             ])
         return ";".join(parts)
-    if EXCLUDE_MODE == "box":
-        return (
-            f"exclude_mode=box;"
-            f"position={tuple_to_string(BOX_POSITION)};"
-            f"rotation={tuple_to_string(BOX_ROTATION)};"
-            f"length={tuple_to_string(BOX_LENGTH)};"
-            f"rotation_order={BOX_ROTATION_ORDER}"
-        )
     raise ValueError(f"Unsupported EXCLUDE_MODE: {EXCLUDE_MODE}")
 
 
 def load_cached_results(output_prefixes, threshold: float, array_name: str, spatial_signature: str):
-    for out_prefix in output_prefixes:
-        csv_path = out_prefix.with_suffix(".csv")
+    cached = {}
+    cache_sources = []
+
+    for csv_path in build_cache_csv_paths(output_prefixes):
         if not csv_path.exists():
             continue
 
-        cached = {}
+        rows_loaded = 0
         with open(csv_path, newline="") as f:
             reader = csv.DictReader(f)
             for row in reader:
@@ -293,11 +304,87 @@ def load_cached_results(output_prefixes, threshold: float, array_name: str, spat
                     "original_total_cells": original_total_cells,
                     "data_origin": row.get("data_origin", "cached"),
                 }
+                rows_loaded += 1
 
-        if cached:
-            return cached, csv_path
+        if rows_loaded:
+            cache_sources.append((csv_path, rows_loaded))
 
-    return {}, None
+    return cached, cache_sources
+
+
+def load_ok_log_results(log_path: Path, threshold: float):
+    if not log_path.exists():
+        raise FileNotFoundError(f"IMPORT_OK_LOG_PATH does not exist:\n{log_path}")
+
+    threshold_key = str(float(threshold))
+    ok_pattern = re.compile(
+        r"\[OK\]\s+result_(\d+)\.vtu:.*?"
+        r"fraction_above_([0-9.+\-eE]+)=([0-9.+\-eE]+),\s+"
+        r"cells_above_[^=]+=([0-9]+)/([0-9]+),\s+"
+        r"included=([0-9]+),\s+excluded=([0-9]+),\s+original_total=([0-9]+)"
+    )
+
+    cached = {}
+    with open(log_path, "r", errors="replace") as f:
+        for line in f:
+            line = ANSI_ESCAPE_RE.sub("", line).replace("^[[A", "")
+            match = ok_pattern.search(line)
+            if match is None:
+                continue
+
+            row_idx = int(match.group(1))
+            row_threshold_key = str(float(match.group(2)))
+            if row_threshold_key != threshold_key:
+                continue
+
+            fraction = float(match.group(3))
+            count = int(match.group(4))
+            n_cells = int(match.group(5))
+            n_included = int(match.group(6))
+            excluded_cells = int(match.group(7))
+            original_total_cells = int(match.group(8))
+
+            if n_cells != n_included:
+                continue
+
+            cached[row_idx] = {
+                "fraction": fraction,
+                "count": count,
+                "total_cells": n_cells,
+                "excluded_cells": excluded_cells,
+                "original_total_cells": original_total_cells,
+                "data_origin": "imported_ok_log",
+            }
+
+    return cached
+
+
+def build_csv_row(
+    t,
+    idx,
+    frac,
+    frac_norm,
+    count,
+    n_cells,
+    n_excl,
+    n_orig,
+    row_origin,
+    spatial_signature,
+):
+    return [
+        f"{t:.8f}",
+        idx,
+        f"{frac:.8f}",
+        f"{frac_norm:.8f}",
+        int(count),
+        int(n_cells),
+        int(n_excl),
+        int(n_orig),
+        THRESHOLD,
+        ARRAY_NAME,
+        row_origin,
+        spatial_signature,
+    ]
 
 
 def write_csv(
@@ -313,24 +400,16 @@ def write_csv(
     data_origin,
     spatial_signature,
 ):
+    if isinstance(data_origin, (str, type(None))):
+        data_origins = [data_origin] * len(times)
+    else:
+        data_origins = data_origin
+
     with open(csv_path, "w", newline="") as f:
         writer = csv.writer(f)
-        writer.writerow([
-            "time_s",
-            "file_index",
-            "fraction_above_threshold",
-            "normalized_fraction_above_threshold",
-            "cells_above_threshold",
-            "total_cells",
-            "excluded_cells",
-            "original_total_cells",
-            "threshold",
-            "array_name",
-            "data_origin",
-            "spatial_signature",
-        ])
+        writer.writerow(CSV_HEADER)
 
-        for t, (idx, _), frac, frac_norm, count, n_cells, n_excl, n_orig in zip(
+        for t, (idx, _), frac, frac_norm, count, n_cells, n_excl, n_orig, row_origin in zip(
             times,
             selected,
             fractions,
@@ -339,21 +418,50 @@ def write_csv(
             total_cells,
             excluded_cells,
             original_total_cells,
+            data_origins,
         ):
-            writer.writerow([
-                f"{t:.8f}",
-                idx,
-                f"{frac:.8f}",
-                f"{frac_norm:.8f}",
-                int(count),
-                int(n_cells),
-                int(n_excl),
-                int(n_orig),
-                THRESHOLD,
-                ARRAY_NAME,
-                data_origin,
+            writer.writerow(
+                build_csv_row(
+                    t,
+                    idx,
+                    frac,
+                    frac_norm,
+                    count,
+                    n_cells,
+                    n_excl,
+                    n_orig,
+                    row_origin,
+                    spatial_signature,
+                )
+            )
+
+
+def append_progress_record(progress_csv_path: Path, record, spatial_signature: str):
+    if not WRITE_PROGRESS_CACHE:
+        return
+
+    progress_csv_path.parent.mkdir(parents=True, exist_ok=True)
+    should_write_header = not progress_csv_path.exists()
+
+    with open(progress_csv_path, "a", newline="") as f:
+        writer = csv.writer(f)
+        if should_write_header:
+            writer.writerow(CSV_HEADER)
+
+        writer.writerow(
+            build_csv_row(
+                record["time"],
+                record["idx"],
+                record["fraction"],
+                record["fraction"],
+                record["count"],
+                record["total_cells"],
+                record["excluded_cells"],
+                record["original_total_cells"],
+                record["data_origin"],
                 spatial_signature,
-            ])
+            )
+        )
 
 
 def get_fraction_y_limits(fractions):
@@ -425,62 +533,6 @@ def get_cell_centers_numpy(grid):
     if pts is None:
         return np.empty((0, 3), dtype=float)
     return vtk_to_numpy(pts.GetData())
-
-
-def apply_rotation_order(transform, rotation_deg, order):
-    rx, ry, rz = rotation_deg
-    for axis in order.upper():
-        if axis == "X":
-            transform.RotateX(rx)
-        elif axis == "Y":
-            transform.RotateY(ry)
-        elif axis == "Z":
-            transform.RotateZ(rz)
-        else:
-            raise ValueError(f"Unsupported rotation axis in order '{order}': {axis}")
-
-
-def vtk_matrix_to_numpy(vtk_matrix):
-    m = np.zeros((4, 4), dtype=float)
-    for i in range(4):
-        for j in range(4):
-            m[i, j] = vtk_matrix.GetElement(i, j)
-    return m
-
-
-def build_keep_mask_from_exclusion_box(cell_centers):
-    n = cell_centers.shape[0]
-    if not EXCLUDE_BOX:
-        return np.ones(n, dtype=bool)
-
-    if n == 0:
-        return np.ones(0, dtype=bool)
-
-    transform = vtk.vtkTransform()
-    transform.Identity()
-
-    apply_rotation_order(transform, BOX_ROTATION, BOX_ROTATION_ORDER)
-    transform.Translate(*BOX_POSITION)
-
-    inverse = vtk.vtkTransform()
-    inverse.DeepCopy(transform)
-    inverse.Inverse()
-
-    M = vtk_matrix_to_numpy(inverse.GetMatrix())
-
-    pts_h = np.column_stack([cell_centers, np.ones(n, dtype=float)])
-    pts_local_h = pts_h @ M.T
-    pts_local = pts_local_h[:, :3]
-
-    half_lengths = 0.5 * np.asarray(BOX_LENGTH, dtype=float)
-
-    inside_box = np.all(
-        np.abs(pts_local) <= (half_lengths + BOX_TOL),
-        axis=1
-    )
-
-    keep_mask = ~inside_box
-    return keep_mask
 
 
 def build_side_mask_from_plane(cell_centers, origin, normal, keep_positive_side, tol):
@@ -562,8 +614,6 @@ def build_keep_mask(cell_centers):
         return build_keep_mask_from_plane(cell_centers)
     elif EXCLUDE_MODE == "multi_plane":
         return build_keep_mask_from_multi_plane(cell_centers)
-    elif EXCLUDE_MODE == "box":
-        return build_keep_mask_from_exclusion_box(cell_centers)
     else:
         raise ValueError(f"Unsupported EXCLUDE_MODE: {EXCLUDE_MODE}")
 
@@ -591,6 +641,106 @@ def write_debug_mask_vtu(debug_vtu_path: Path, grid, keep_mask):
     writer.SetFileName(str(debug_vtu_path))
     writer.SetInputData(debug_grid)
     writer.Write()
+
+
+def is_full_threshold_record(record):
+    return record["total_cells"] > 0 and record["count"] >= record["total_cells"]
+
+
+def make_inferred_full_plateau_record(idx, path, reference_record):
+    n_cells = int(reference_record["total_cells"])
+    n_excluded = int(reference_record["excluded_cells"])
+    n_original = int(reference_record["original_total_cells"])
+    origin = reference_record["data_origin"]
+
+    return {
+        "idx": idx,
+        "path": path,
+        "time": idx * DT,
+        "fraction": 1.0 if n_cells > 0 else 0.0,
+        "count": n_cells,
+        "total_cells": n_cells,
+        "excluded_cells": n_excluded,
+        "original_total_cells": n_original,
+        "data_origin": f"{origin}+inferred_full_plateau",
+    }
+
+
+def process_result_file(idx, path, cached_results, results_dir, first_selected_idx):
+    cached = cached_results.get(idx)
+
+    if cached is not None:
+        fraction_above = float(cached["fraction"])
+        count_above = int(cached["count"])
+        n_cells = int(cached["total_cells"])
+        n_excluded = int(cached["excluded_cells"])
+        n_original = int(cached["original_total_cells"])
+        origin = cached["data_origin"]
+
+        print(
+            f"[CACHE] {path.name}: time={idx * DT:.4f} s, "
+            f"fraction_above_{THRESHOLD}={fraction_above:.8f}, "
+            f"cells_above_{THRESHOLD}={count_above}/{n_cells}, "
+            f"excluded={n_excluded}, original_total={n_original}"
+        )
+    else:
+        grid, values, origin = read_grid_and_array_as_cell_array(path, ARRAY_NAME)
+
+        cell_centers = get_cell_centers_numpy(grid)
+        if values.size != cell_centers.shape[0]:
+            raise RuntimeError(
+                f"Mismatch in {path.name}: values has {values.size} entries but "
+                f"cell centers has {cell_centers.shape[0]} entries."
+            )
+
+        keep_mask = build_keep_mask(cell_centers)
+        if WRITE_DEBUG_MASK_VTU:
+            should_write_debug = True
+            if DEBUG_MASK_ONLY_FIRST_FILE and idx != first_selected_idx:
+                should_write_debug = False
+
+            if should_write_debug:
+                debug_vtu_path = get_results_output_root(results_dir) / f"debug_clip_{path.stem}.vtu"
+                write_debug_mask_vtu(debug_vtu_path, grid, keep_mask)
+                print(f"[DEBUG] Mask VTU written to: {debug_vtu_path}")
+
+        values_kept = values[keep_mask]
+
+        n_original = int(values.size)
+        n_included = int(np.count_nonzero(keep_mask))
+        n_cells = int(values_kept.size)
+        n_excluded = int(n_original - n_included)
+
+        if n_cells != n_included:
+            raise RuntimeError(
+                f"Mismatch in {path.name}: n_cells={n_cells} but n_included={n_included}"
+            )
+
+        print(
+            f"[MASK] {path.name}: included={n_included}, excluded={n_excluded}, original_total={n_original}"
+        )
+
+        count_above = int(np.count_nonzero(values_kept > THRESHOLD))
+        fraction_above = (count_above / n_cells) if n_cells > 0 else 0.0
+
+        print(
+            f"[OK] {path.name}: time={idx * DT:.4f} s, "
+            f"fraction_above_{THRESHOLD}={fraction_above:.8f}, "
+            f"cells_above_{THRESHOLD}={count_above}/{n_cells}, "
+            f"included={n_included}, excluded={n_excluded}, original_total={n_original}"
+        )
+
+    return {
+        "idx": idx,
+        "path": path,
+        "time": idx * DT,
+        "fraction": fraction_above,
+        "count": count_above,
+        "total_cells": n_cells,
+        "excluded_cells": n_excluded,
+        "original_total_cells": n_original,
+        "data_origin": origin,
+    }
 
 
 def make_unique_snapshot_dir(parent_dir: Path):
@@ -669,6 +819,7 @@ def main():
     print(f"[INFO] Time window      : [{t_start}, {t_end}] s")
     print(f"[INFO] Files selected   : {len(selected)}")
     print(f"[INFO] First/last       : result_{selected[0][0]}.vtu to result_{selected[-1][0]}.vtu")
+    print(f"[INFO] Infer plateau    : {INFER_FULL_THRESHOLD_PLATEAU}")
     print(f"[INFO] Exclude mode     : {EXCLUDE_MODE}")
     if EXCLUDE_MODE == "plane":
         if len(PLANES) > 0:
@@ -686,27 +837,29 @@ def main():
             print(f"[INFO] Plane {i} origin  : {plane['origin']}")
             print(f"[INFO] Plane {i} normal  : {plane['normal']}")
             print(f"[INFO] Plane {i} keep +  : {plane['keep_positive_side']}")
-    if EXCLUDE_MODE == "box":
-        print(f"[INFO] Box position     : {BOX_POSITION}")
-        print(f"[INFO] Box rotation     : {BOX_ROTATION}")
-        print(f"[INFO] Box length       : {BOX_LENGTH}")
-        print(f"[INFO] Rotation order   : {BOX_ROTATION_ORDER}")
 
     out_prefixes = build_output_prefixes(results_dir, OUT_PREFIX)
     spatial_signature = build_spatial_signature()
 
     if USE_CACHE:
-        cached_results, cache_source = load_cached_results(
+        cached_results, cache_sources = load_cached_results(
             out_prefixes,
             THRESHOLD,
             ARRAY_NAME,
             spatial_signature,
         )
     else:
-        cached_results, cache_source = {}, None
+        cached_results, cache_sources = {}, []
 
-    if cache_source is not None:
-        print(f"[INFO] Cache source     : {cache_source}")
+    if IMPORT_OK_LOG_PATH is not None:
+        imported_log_results = load_ok_log_results(Path(IMPORT_OK_LOG_PATH), THRESHOLD)
+        cached_results.update(imported_log_results)
+        if imported_log_results:
+            cache_sources.append((Path(IMPORT_OK_LOG_PATH), len(imported_log_results)))
+
+    if cache_sources:
+        for cache_source, rows_loaded in cache_sources:
+            print(f"[INFO] Cache source     : {cache_source} ({rows_loaded} rows)")
         print(f"[INFO] Cached rows      : {len(cached_results)}")
 
     results_output_root = get_results_output_root(results_dir)
@@ -714,98 +867,110 @@ def main():
     if snapshot_dir is not None:
         print(f"[INFO] Existing results-side contents moved to: {snapshot_dir}")
 
-    times = []
-    counts = []
-    fractions = []
-    total_cells = []
-    excluded_cells = []
-    original_total_cells = []
-    data_origin_used = None
+    progress_csv_paths = [build_progress_cache_path(out_prefix) for out_prefix in out_prefixes]
+    if WRITE_PROGRESS_CACHE:
+        for progress_csv_path in progress_csv_paths:
+            print(f"[INFO] Progress cache   : {progress_csv_path}")
 
-    for idx, path in selected:
-        cached = cached_results.get(idx)
+    records_by_pos = {}
 
-        if cached is not None:
-            fraction_above = float(cached["fraction"])
-            count_above = int(cached["count"])
-            n_cells = int(cached["total_cells"])
-            n_excluded = int(cached["excluded_cells"])
-            n_original = int(cached["original_total_cells"])
-            origin = cached["data_origin"]
+    pos = 0
+    while pos < len(selected):
+        idx, path = selected[pos]
+        record = process_result_file(idx, path, cached_results, results_dir, selected[0][0])
+        records_by_pos[pos] = record
+        for progress_csv_path in progress_csv_paths:
+            append_progress_record(progress_csv_path, record, spatial_signature)
 
-            if data_origin_used is None:
-                data_origin_used = origin
-
+        if (
+            INFER_FULL_THRESHOLD_PLATEAU
+            and is_full_threshold_record(record)
+            and pos < len(selected) - 1
+        ):
             print(
-                f"[CACHE] {path.name}: time={idx * DT:.4f} s, "
-                f"fraction_above_{THRESHOLD}={fraction_above:.8f}, "
-                f"cells_above_{THRESHOLD}={count_above}/{n_cells}, "
-                f"excluded={n_excluded}, original_total={n_original}"
+                f"[INFO] Full threshold plateau reached at {path.name}; "
+                "processing backward from the final selected file."
             )
-        else:
-            grid, values, origin = read_grid_and_array_as_cell_array(path, ARRAY_NAME)
-            if data_origin_used is None:
-                data_origin_used = origin
 
-            cell_centers = get_cell_centers_numpy(grid)
-            if values.size != cell_centers.shape[0]:
-                raise RuntimeError(
-                    f"Mismatch in {path.name}: values has {values.size} entries but "
-                    f"cell centers has {cell_centers.shape[0]} entries."
+            backward_full_pos = None
+            back_pos = len(selected) - 1
+            while back_pos > pos:
+                back_idx, back_path = selected[back_pos]
+                back_record = process_result_file(
+                    back_idx,
+                    back_path,
+                    cached_results,
+                    results_dir,
+                    selected[0][0],
+                )
+                records_by_pos[back_pos] = back_record
+                for progress_csv_path in progress_csv_paths:
+                    append_progress_record(progress_csv_path, back_record, spatial_signature)
+
+                if is_full_threshold_record(back_record):
+                    backward_full_pos = back_pos
+                    break
+
+                back_pos -= 1
+
+            if backward_full_pos is not None:
+                end_record = records_by_pos[backward_full_pos]
+                if (
+                    record["total_cells"] != end_record["total_cells"]
+                    or record["excluded_cells"] != end_record["excluded_cells"]
+                    or record["original_total_cells"] != end_record["original_total_cells"]
+                ):
+                    print(
+                        "[WARN] Plateau endpoints have different cell totals; "
+                        "inferred middle rows will use the first full-plateau totals."
+                    )
+
+                inferred_count = max(0, backward_full_pos - pos - 1)
+                for fill_pos in range(pos + 1, backward_full_pos):
+                    fill_idx, fill_path = selected[fill_pos]
+                    records_by_pos[fill_pos] = make_inferred_full_plateau_record(
+                        fill_idx,
+                        fill_path,
+                        record,
+                    )
+                    for progress_csv_path in progress_csv_paths:
+                        append_progress_record(
+                            progress_csv_path,
+                            records_by_pos[fill_pos],
+                            spatial_signature,
+                        )
+
+                print(
+                    f"[INFO] Inferred {inferred_count} full-plateau timesteps between "
+                    f"{path.name} and {selected[backward_full_pos][1].name}."
+                )
+            else:
+                print(
+                    "[INFO] No second full-plateau endpoint found while scanning backward; "
+                    "all remaining timesteps were processed explicitly."
                 )
 
-            keep_mask = build_keep_mask(cell_centers)
-            if WRITE_DEBUG_MASK_VTU:
-                should_write_debug = True
-                if DEBUG_MASK_ONLY_FIRST_FILE and idx != selected[0][0]:
-                    should_write_debug = False
+            break
 
-                if should_write_debug:
-                    debug_vtu_path = get_results_output_root(results_dir) / f"debug_clip_{path.stem}.vtu"
-                    write_debug_mask_vtu(debug_vtu_path, grid, keep_mask)
-                    print(f"[DEBUG] Mask VTU written to: {debug_vtu_path}")
+        pos += 1
 
-            values_kept = values[keep_mask]
+    missing_positions = [i for i in range(len(selected)) if i not in records_by_pos]
+    if missing_positions:
+        missing_names = ", ".join(selected[i][1].name for i in missing_positions[:5])
+        raise RuntimeError(
+            f"Internal error: missing processed rows for {len(missing_positions)} files. "
+            f"First missing: {missing_names}"
+        )
 
-            n_original = int(values.size)
-            n_included = int(np.count_nonzero(keep_mask))
-            n_cells = int(values_kept.size)
-            n_excluded = int(n_original - n_included)
+    records = [records_by_pos[i] for i in range(len(selected))]
+    data_origins = [record["data_origin"] for record in records]
 
-            if n_cells != n_included:
-                raise RuntimeError(
-                    f"Mismatch in {path.name}: n_cells={n_cells} but n_included={n_included}"
-                )
-
-            print(
-                f"[MASK] {path.name}: included={n_included}, excluded={n_excluded}, original_total={n_original}"
-            )
-
-            count_above = int(np.count_nonzero(values_kept > THRESHOLD))
-            fraction_above = (count_above / n_cells) if n_cells > 0 else 0.0
-
-            print(
-                f"[OK] {path.name}: time={idx * DT:.4f} s, "
-                f"fraction_above_{THRESHOLD}={fraction_above:.8f}, "
-                f"cells_above_{THRESHOLD}={count_above}/{n_cells}, "
-                f"included={n_included}, excluded={n_excluded}, original_total={n_original}"
-            )
-
-        t = idx * DT
-
-        times.append(t)
-        counts.append(count_above)
-        fractions.append(fraction_above)
-        total_cells.append(n_cells)
-        excluded_cells.append(n_excluded)
-        original_total_cells.append(n_original)
-
-    times = np.asarray(times, dtype=float)
-    counts = np.asarray(counts, dtype=float)
-    fractions = np.asarray(fractions, dtype=float)
-    total_cells = np.asarray(total_cells, dtype=int)
-    excluded_cells = np.asarray(excluded_cells, dtype=int)
-    original_total_cells = np.asarray(original_total_cells, dtype=int)
+    times = np.asarray([record["time"] for record in records], dtype=float)
+    counts = np.asarray([record["count"] for record in records], dtype=float)
+    fractions = np.asarray([record["fraction"] for record in records], dtype=float)
+    total_cells = np.asarray([record["total_cells"] for record in records], dtype=int)
+    excluded_cells = np.asarray([record["excluded_cells"] for record in records], dtype=int)
+    original_total_cells = np.asarray([record["original_total_cells"] for record in records], dtype=int)
 
     max_fraction = float(np.max(fractions)) if len(fractions) > 0 else 0.0
     fractions_norm = fractions / max_fraction if max_fraction > 0 else np.zeros_like(fractions)
@@ -833,7 +998,7 @@ def main():
                 total_cells,
                 excluded_cells,
                 original_total_cells,
-                data_origin_used,
+                data_origins,
                 spatial_signature,
             )
 
@@ -877,7 +1042,8 @@ def main():
         print(f"Plot written to: {png_path}")
     for animation_dir in saved_animation_dirs:
         print(f"Animation frames written to: {animation_dir}")
-    print(f"Data origin used: {data_origin_used}")
+    unique_data_origins = list(dict.fromkeys(data_origins))
+    print(f"Data origins used: {', '.join(str(origin) for origin in unique_data_origins)}")
 
 
 if __name__ == "__main__":
