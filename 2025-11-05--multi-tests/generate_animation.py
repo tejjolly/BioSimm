@@ -15,7 +15,7 @@ from pathlib import Path
 # SETTINGS — EDIT THESE
 # ============================================================
 
-RESULTS_DIR = "/Volumes/maxone/2026-02-03--mass_balance/g87_r43/96-procs"
+RESULTS_DIR = "/Volumes/maxone/2026-02-03--mass_balance/g87_r62/96-procs"
 OUTPUT_FOLDER_NAME = "3d_dye_frames"
 
 START_INDEX = 172

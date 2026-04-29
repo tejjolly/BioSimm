@@ -24,11 +24,11 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 # ============================================================
 # TOGGLES — change here in the IDE
 # ============================================================
-BASE = "/Volumes/maxone/2026-02-03--mass_balance"
-# BASE = "/Volumes/biosimm-Tej-Jolly/2026-02-03--mass_balance"
+# BASE = "/Volumes/maxone/2026-02-03--mass_balance"
+BASE = "/Volumes/biosimm-Tej-Jolly/2026-02-03--mass_balance"
 RUN_PHASES = [1,2]          # e.g. [1,2,3] or [2,3] or [3]
 CASES = [
-    "g87_r43",
+    "g87_r24",
 ]
 PLOT_VELOCITY = False         # show velocity + secondary y in phase 2
 THRESHOLD = 0            # slope: from max conc down to <= this
@@ -37,8 +37,8 @@ NORMALIZE_CONC = True        # normalize phase-2 curves by their own max
 NORMALIZED_TAG = False
 PHASE1_MANUAL_TIME = None    # set a physical time to override the auto t_max lookup in phase 1
 REVERSE_CENTERLINE_DIRECTION = True  # if True, treat the end of the current arc/profile as the physical inlet
-PHASE2_ANIMATION_TIME_RANGE = (1.72, 24.08)  # set to (t_start, t_end) to save one frame per available time in that range
-# PHASE2_ANIMATION_TIME_RANGE = (4.3, 26.6)  # set to (t_start, t_end) to save one frame per available time in that range
+# PHASE2_ANIMATION_TIME_RANGE = (1.72, 24.08)  # set to (t_start, t_end) to save one frame per available time in that range
+PHASE2_ANIMATION_TIME_RANGE = (4.3, 26.6)  # set to (t_start, t_end) to save one frame per available time in that range
 PHASE2_ANIMATION_DPI = 300
 PHASE2_OUTPUT_FORMATS = ("png", "svg")
 OVERWRITE_EXISTING = False  # if False, skip CSVs/frames that already exist; if True, regenerate them
